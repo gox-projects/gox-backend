@@ -2,7 +2,7 @@
 
 package androidbackend
 
-// V2 渲染内核的 cgo 绑定：gx_android_* C ABI（定义见 rust/rust/src/
+// V2 渲染内核的 cgo 绑定：gx_android_* C ABI（定义见 backend/rust/rust/src/
 // android_abi.rs）+ ANativeWindow 的 JNI 提取（native_window_jni.c）。
 //
 // 生命周期契约：surface 随 Activity 可见性销毁重建。OnSurfaceReady 注入/
@@ -38,11 +38,12 @@ import (
 
 // renderer 持有 Rust 渲染宿主句柄。零值 = 未初始化（surface 未就绪）。
 type renderer struct {
-	host   unsafe.Pointer
-	physW  int
-	physH  int
-	inited bool
-	fails  int
+	host     unsafe.Pointer
+	physW    int
+	physH    int
+	inited   bool
+	fails    int
+	disabled bool // V2 连续渲染失败后置位：永久回退 GLES blit，保证有画面
 }
 
 var v2r renderer
@@ -108,6 +109,14 @@ func v2Render() error {
 	}
 	if rc := C.gx_android_render(v2r.host); rc != 0 {
 		v2r.fails++
+		// 连续失败超过阈值：判定 V2 渲染内核在本机不可用（无 GPU/present 失败），
+		// 永久禁用并回退 GLES blit（skia CPU raster），保证有画面而不是黑屏。
+		// 前几帧允许瞬时失败（surface 预热/Outdated 自愈），不急于回退。
+		if v2r.fails == maxV2Fails {
+			fmt.Printf("[androidbackend] V2 连续渲染失败 %d 次，永久回退 GLES blit\n", v2r.fails)
+			v2r.disabled = true
+			v2Destroy()
+		}
 		if v2r.fails == 1 || v2r.fails%120 == 0 {
 			return fmt.Errorf("gx_android_render rc=%d（连续 %d 次）", rc, v2r.fails)
 		}
@@ -117,6 +126,8 @@ func v2Render() error {
 	return nil
 }
 
+const maxV2Fails = 12
+
 func v2Destroy() {
 	if v2r.inited {
 		C.gx_android_destroy(v2r.host)
@@ -124,7 +135,15 @@ func v2Destroy() {
 	}
 }
 
-func v2Ready() bool { return v2r.inited }
+func v2Ready() bool    { return v2r.inited && !v2r.disabled }
+func v2Disabled() bool { return v2r.disabled }
+
+// v2ResetForNewSurface 在 surface 重建（Activity 重新可见）时调用：给 V2 一次
+// 全新机会（清除禁用/失败计数），因为新环境可能已具备 GPU 能力。
+func v2ResetForNewSurface() {
+	v2r.disabled = false
+	v2r.fails = 0
+}
 
 // nativeWindow 在 JVM 线程上经反射链取当前 ANativeWindow*。
 func nativeWindow() unsafe.Pointer {

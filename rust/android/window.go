@@ -27,10 +27,10 @@ import (
 
 	rustbackend "github.com/robertpanvip/gox-backend-rust"
 	skia "github.com/robertpanvip/gox-backend-skia"
-	sk "github.com/robertpanvip/gox-skia/compat"
 	gxapp "github.com/robertpanvip/gox-core/runtime/app"
 	gxscene "github.com/robertpanvip/gox-core/runtime/scene"
 	"github.com/robertpanvip/gox-core/runtime/scheduler"
+	sk "github.com/robertpanvip/gox-skia/compat"
 
 	"golang.org/x/mobile/event/touch"
 	"golang.org/x/mobile/gl"
@@ -187,6 +187,7 @@ func (w *Window) SetTouchSink(s TouchSink) {
 // OnSurfaceReady 在 lifecycle CrossOn 调用：EGL 就绪，初始化 GLES blit。
 // V2 渲染器在首个 paint（surface 已挂载）时懒初始化，见 paintNow。
 func (w *Window) OnSurfaceReady(glctx gl.Context) error {
+	v2ResetForNewSurface() // surface 重建：给 V2 一次全新机会
 	w.mu.Lock()
 	w.glctx = glctx
 	w.visible = true
@@ -258,7 +259,8 @@ func (w *Window) OnPaint() bool {
 	}
 
 	// V2 渲染器懒初始化（首个 paint 时 surface 已挂载）。
-	if !v2Ready() {
+	// v2Disabled 为真时不重试：本机已判定 V2 不可用，稳定走 GLES 回退。
+	if !v2Ready() && !v2Disabled() {
 		if nw := nativeWindow(); nw != nil {
 			lw, lh := w.logicalSizeLocked()
 			if err := v2New(nw, lw, lh); err != nil {

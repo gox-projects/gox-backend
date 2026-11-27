@@ -44,8 +44,20 @@ pub extern "C" fn gx_android_new(
         height as u32,
         Box::new(|| {}), // request_redraw：Android 的帧时机由宿主 paintClock 驱动，无需回调
     ));
-    let renderer = match pollster::block_on(Renderer::new(surface.clone())) {
-        r => r,
+    // wgpu 在无 GPU 的 Android 环境（如 swiftshader/TCG 模拟器）下
+    // request_adapter/request_device 可能返回 None，Renderer::new 内部用
+    // expect() 会 panic。绝不能让它穿越 FFI 崩掉整个 native 进程——否则
+    // 宿主侧 GLES 回退路径永远没机会执行（现象=启动即黑屏/闪退）。
+    // 这里捕获 panic，转成 NULL 返回给 Go 侧触发回退。
+    let surface_for_init = surface.clone();
+    let renderer = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        pollster::block_on(Renderer::new(surface_for_init))
+    })) {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("[gx-android] gx_android_new: wgpu 初始化 panic（无可用 adapter/device？），返回 NULL 触发宿主回退");
+            return std::ptr::null_mut();
+        }
     };
     let host = Box::new(AndroidHost {
         surface,
@@ -134,7 +146,16 @@ pub extern "C" fn gx_android_set_window(
     }
     let h = unsafe { &*host };
     h.surface.set_native_window(native_window, width as u32, height as u32);
-    let renderer = pollster::block_on(Renderer::new(h.surface.clone()));
+    let surface = h.surface.clone();
+    let renderer = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        pollster::block_on(Renderer::new(surface))
+    })) {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("[gx-android] gx_android_set_window: wgpu 重建 panic，保留旧渲染器");
+            return 3;
+        }
+    };
     let mut g = match h.renderer.lock() {
         Ok(g) => g,
         Err(_) => return 2,
