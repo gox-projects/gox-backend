@@ -943,12 +943,15 @@ impl Renderer {
         }
         let (win_w, win_h) = self.provider_logical();
         let scene = self.scene.as_ref();
+        // 数据源：全节点布局盒（node_boxes，scan 全树收集）而非 hitboxes——
+        // hitboxes 只登记带 on* 事件的交互节点，编辑器行等静态节点反查不到，
+        // E2E 的点击定位/选区命中会整体失效。
         let boxes: Vec<BoxJson> = self
             .display
-            .hitboxes
+            .node_boxes
             .iter()
-            .filter_map(|h| {
-                let node = scene.and_then(|sc| find(sc, h.4));
+            .filter_map(|&(x, y, w, h, nid)| {
+                let node = scene.and_then(|sc| find(sc, nid));
                 node.map(|n| BoxJson {
                     label: label_of(n),
                     testid: n.props.get("testid").cloned().unwrap_or_default(),
@@ -959,10 +962,10 @@ impl Renderer {
                     },
                     class: n.props.get("class").cloned().unwrap_or_default(),
                     data_line: n.props.get("data-line").cloned().unwrap_or_default(),
-                    x: h.0,
-                    y: h.1,
-                    w: h.2,
-                    h: h.3,
+                    x,
+                    y,
+                    w,
+                    h,
                 })
             })
             .collect();
@@ -1593,7 +1596,9 @@ mod threeway_tests {
     fn threeway_matrix() {
         let manifest = env!("CARGO_MANIFEST_DIR");
         let path = std::env::var("GX_THREEWAY_CASES")
-            .unwrap_or_else(|_| format!("{}/../../../testdata/threeway/cases.json", manifest));
+            // gox-backend 仓根在 rust/rust 上两级（旧 gox 仓是 backend/rust/rust
+            // 三级——拆仓去掉 backend/ 中间层后层级少一）。
+            .unwrap_or_else(|_| format!("{}/../../testdata/threeway/cases.json", manifest));
         let raw =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读取用例 {}: {}", path, e));
         let suite: serde_json::Value = serde_json::from_str(&raw).unwrap();

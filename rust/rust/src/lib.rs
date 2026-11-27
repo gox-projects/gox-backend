@@ -705,6 +705,7 @@ fn winit_app_for(backend: &Backend) -> WinitApp {
         first_frame_done: false,
         window: None,
         modifiers: winit::keyboard::ModifiersState::empty(),
+        pending_focus: false,
         hover_cursor: String::new(),
         vsync: backend.vsync.clone(),
         passthrough: backend.passthrough.clone(),
@@ -809,6 +810,8 @@ struct WinitApp {
     // （winit 在 KeyboardInput 前派发 ModifiersChanged，缓存供 key/pointer 事件携带）。
     window: Option<Arc<Window>>,
     modifiers: winit::keyboard::ModifiersState,
+    /// 首帧补做 input focus 的意图标记（X11 无 WM 环境键盘可达性）。
+    pending_focus: bool,
     hover_cursor: String,
     /// VSync 请求模式（P4.5 VSyncControl）：resumed 创建渲染器后据此应用。
     vsync: Arc<std::sync::atomic::AtomicU8>,
@@ -893,6 +896,13 @@ impl winit::application::ApplicationHandler<GxEvent> for WinitApp {
             .as_ref()
             .unwrap()
             .request_redraw();
+        // 主动抢占 X input focus：无 WM 环境（Xvfb/最小化桌面）焦点为
+        // PointerRoot，键盘事件不按指针位置分发到 winit 的 XI2 选择集，
+        // 字符/快捷键全部丢失（GUI E2E 键盘链路断流根因）。GLFW 路径
+        // 由库内部 SetInputFocus，winit 不会自动做。这里只标记意图——
+        // resumed 时窗口尚未 map，XSetInputFocus 对未映射窗口是 no-op，
+        // 真正调用推迟到首帧 RedrawRequested（见 window_event）。
+        self.pending_focus = true;
         if self.probe {
             self.t_resumed_done = Some(std::time::Instant::now());
         }
@@ -935,6 +945,18 @@ impl winit::application::ApplicationHandler<GxEvent> for WinitApp {
                 renderer.request_redraw();
             }
             WindowEvent::RedrawRequested => {
+                // 首帧即窗口已 map：补做 X input focus（resumed 时窗口未映射，
+                // winit focus_window 又只发 ICCCM _NET_ACTIVE_WINDOW 消息给
+                // WM——无 WM 环境无人处理，键盘断流；这里直设 XSetInputFocus）。
+                if self.pending_focus {
+                    self.pending_focus = false;
+                    if let Some(w) = self.window.as_ref() {
+                        let r = crate::passthrough::set_input_focus(w);
+                        if std::env::var_os("GX_FOCUS_DEBUG").is_some() {
+                            eprintln!("[rust-backend] set_input_focus -> {r:?} mapped={:?} size={:?}", w.is_visible(), w.inner_size());
+                        }
+                    }
+                }
                 // 排空 FIFO 队列，按顺序 apply 每一帧（评审 P0：增量不丢）。
                 // 若队列积压很多（事件循环落后于提交速率），逐帧 apply 会把镜像追到最新；
                 // 每帧都成功时 applied 递增，任一增量因无基线失败会由 Go 侧全量重发兜底。
@@ -1237,7 +1259,10 @@ impl winit::application::ApplicationHandler<GxEvent> for WinitApp {
                             text: text.to_string(),
                             x: 0.0,
                             y: 0.0,
-                            mods: String::new(),
+                            // 必须携带修饰键：Ctrl/Alt 组合键的字符（Ctrl+A 的 'a'）
+                            // 翻译层按 mods 过滤，不带会回放字符破坏选区语义
+                            // （Ctrl+A 全选 → ime 'a' 插入覆盖选区 → Ctrl+C 复制空）。
+                            mods: mods_str(self.modifiers),
                         };
                         fire(&self.cb, &self.cb_ctx, &ev.to_json());
                     }

@@ -99,10 +99,22 @@ mod x11 {
 
     pub type XFlushFn = unsafe extern "C" fn(display: *mut std::ffi::c_void) -> c_int;
 
+    /// XSetInputFocus(display, window, revert_to, time)——X11 输入焦点直设。
+    pub type XSetInputFocusFn = unsafe extern "C" fn(
+        display: *mut std::ffi::c_void,
+        window: c_long,
+        revert_to: c_int,
+        time: c_long,
+    );
+
     /// X11 shape 常量（shape.h）：ShapeInput=2、ShapeSet=0、Unsorted=0。
     pub const SHAPE_INPUT: c_int = 2;
     pub const SHAPE_SET: c_int = 0;
     pub const UNSORTED: c_int = 0;
+
+    /// XSetInputFocus 参数：RevertToPointerRoot=1、CurrentTime=0。
+    pub const REVERT_TO_POINTER_ROOT: c_int = 1;
+    pub const CURRENT_TIME: c_long = 0;
 
     /// dlopen 解析 XShapeCombineRectangles + XFlush（libXext/libX11）。
     /// 缓存一次；失败返回 None（无 X11 运行环境时穿透调用报错，不 panic）。
@@ -154,6 +166,57 @@ mod x11 {
         fn dlopen(filename: *const i8, flag: i32) -> *mut std::ffi::c_void;
         fn dlsym(handle: *mut std::ffi::c_void, symbol: *const i8) -> *mut std::ffi::c_void;
     }
+
+    /// 直接设置 X11 input focus（XSetInputFocus）。
+    ///
+    /// winit 的 `focus_window()` 在 X11 走 ICCCM `_NET_ACTIVE_WINDOW` client
+    /// message——发给窗口管理器的请求，无 WM 环境（Xvfb / 最小化桌面）无人
+    /// 处理，键盘事件因焦点停在 PointerRoot 而丢失。这里绕过 WM 协议直设
+    /// 焦点，与 GLFW 内部 SetInputFocus 同语义。
+    pub fn set_input_focus(dpy: *mut std::ffi::c_void, xwin: u64) -> Result<(), String> {
+        static FOCUS_ADDR: OnceLock<usize> = OnceLock::new();
+        let addr = *FOCUS_ADDR.get_or_init(|| unsafe {
+            for name in ["libX11.so.6", "libX11.so"] {
+                let cname = match CString::new(name) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let handle = dlopen(cname.as_ptr(), RTLD_NOW);
+                if handle.is_null() {
+                    continue;
+                }
+                let sym = match CString::new("XSetInputFocus") {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let p = dlsym(handle, sym.as_ptr());
+                if !p.is_null() {
+                    return p as usize;
+                }
+            }
+            0
+        });
+        if addr == 0 {
+            return Err("libX11 not found (XSetInputFocus unavailable)".to_string());
+        }
+        let focus: XSetInputFocusFn = unsafe { std::mem::transmute::<usize, XSetInputFocusFn>(addr) };
+        unsafe {
+            focus(dpy, xwin as c_long, REVERT_TO_POINTER_ROOT, CURRENT_TIME);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn set_input_focus(window: &Window) -> Result<(), String> {
+    let (dpy, xwin) = x11_handles(window)?;
+    x11::set_input_focus(dpy, xwin)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_input_focus(_window: &Window) -> Result<(), String> {
+    // macOS/Windows：winit focus_window 走平台原生 API 有效，无 WM 问题不存在。
+    Err("direct input focus only needed on X11".to_string())
 }
 
 /// 取窗口的 (Xlib display, X11 window) 原生句柄（Wayland 报错）。

@@ -23,7 +23,7 @@ extern int         gx_window_set_vsync(void* handle, int mode);
 extern int         gx_window_set_mouse_passthrough(void* handle, int enabled);
 extern int         gx_window_get_vsync(void* handle);
 extern const char* gx_window_version();
-extern char* gx_window_debug_info();
+extern char* gx_window_debug_info(void* handle);
 extern void gx_window_debug_free(char* ptr);
 extern char* gx_clipboard_get();
 extern void gx_clipboard_free(char* ptr);
@@ -188,8 +188,9 @@ func cVersion() string {
 }
 
 // cDebugInfo 拉取 E2E 调试导出 JSON（窗口逻辑尺寸 + 最近一帧命中框）。
-func cDebugInfo() string {
-	ptr := C.gx_window_debug_info()
+// handle 必传：Rust 侧按 Backend* 解引用，缺省传垃圾指针会 SIGSEGV。
+func cDebugInfo(handle unsafe.Pointer) string {
+	ptr := C.gx_window_debug_info(handle)
 	defer C.gx_window_debug_free(ptr)
 	return C.GoString(ptr)
 }

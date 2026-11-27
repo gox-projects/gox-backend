@@ -623,6 +623,10 @@ pub(crate) struct DisplayList {
     pub(crate) hitboxes: Vec<(f32, f32, f32, f32, u64, String, bool, ClipRect, String)>,
     /// (x, y, w, h, nid)
     pub(crate) inputs: Vec<(f32, f32, f32, f32, u64)>,
+    /// 全节点布局盒 (x, y, w, h, nid)：scan 全树遍历收集（含无事件的静态
+    /// div/span）。供 E2E 调试导出（gx_window_debug_info）做几何反查——
+    /// hitboxes 只登记带 on* 事件的交互节点，编辑器行等静态节点拿不到。
+    pub(crate) node_boxes: Vec<(f32, f32, f32, f32, u64)>,
 }
 
 impl DisplayList {
@@ -634,6 +638,7 @@ impl DisplayList {
             scrollbars: vec![],
             hitboxes: vec![],
             inputs: vec![],
+            node_boxes: vec![],
         }
     }
     /// 把镜像场景树编译成绘制指令。
@@ -649,7 +654,15 @@ impl DisplayList {
     ) -> Self {
         use taffy::prelude::*;
 
-        let mut dl = DisplayList::new();
+        let mut dl = DisplayList {
+            shapes: vec![],
+            texts: vec![],
+            measured: vec![],
+            scrollbars: vec![],
+            hitboxes: vec![],
+            inputs: vec![],
+            node_boxes: vec![],
+        };
 
         // video 原语：先从场景树收集所有 video 节点的播放意图，同步解码器进程。
         // 必须在 emit 取帧之前调用，保证本帧拿到的是最新同步状态。
@@ -1169,12 +1182,14 @@ impl DisplayList {
             oy: f32,
             anchors: &mut std::collections::HashMap<String, (f32, f32, f32, f32)>,
             overlays: &mut Vec<OverlayInfo<'a>>,
+            boxes: &mut Vec<(f32, f32, f32, f32, u64)>,
         ) {
             let lay = ctx.taffy.layout(tnode).unwrap();
             let x = ox + lay.location.x;
             let y = oy + lay.location.y;
             let w = lay.size.width;
             let h = lay.size.height;
+            boxes.push((x, y, w, h, node.nid));
             if let Some(id) = node.props.get("gx-anchor-id") {
                 anchors.insert(id.clone(), (x, y, w, h));
             }
@@ -1192,7 +1207,7 @@ impl DisplayList {
             flat_children(node, &mut kids);
             for (i, c) in kids.iter().enumerate() {
                 let child_tnode = ctx.taffy.child_at_index(tnode, i).unwrap();
-                scan(c, child_tnode, ctx, x, y, anchors, overlays);
+                scan(c, child_tnode, ctx, x, y, anchors, overlays, boxes);
             }
         }
         let mut anchors = std::collections::HashMap::new();
@@ -1205,6 +1220,7 @@ impl DisplayList {
             0.0,
             &mut anchors,
             &mut overlays,
+            &mut dl.node_boxes,
         );
 
         // 计算每个浮层的目标绝对左上角，按 node.id 索引（emit 时套用）。

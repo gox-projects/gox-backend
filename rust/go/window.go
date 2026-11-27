@@ -429,6 +429,10 @@ func (w *Window) Poll() error {
 	w.consumeEvents()
 	w.drainPending()
 	w.consumeEvents()
+	// Run 已是 no-op（P4 目标态 Host 唯一 UI 主循环），pump/postCh 均无读者
+	// ——postQ 只能在这里排空。漏掉这一步会让 Post 的任务（Dispatch 更新、
+	// E2E 快照钩子、输入触发的 Signal 写入）永久滞留，表现为输入断流。
+	w.drainPosts()
 	w.pollFrameClock()
 	return nil
 }
@@ -591,12 +595,13 @@ func (w *Window) DebugWindowSize() (int, int) {
 // gx_window_debug_info（镜像树反查节点文本），未泵过事件循环时返回 nil。
 func (w *Window) DebugAllBoxes() []map[string]any {
 	w.mu.Lock()
-	opened := w.handle != nil && w.pumped
+	handle := w.handle
+	opened := handle != nil && w.pumped
 	w.mu.Unlock()
 	if !opened {
 		return nil
 	}
-	raw := cDebugInfo()
+	raw := cDebugInfo(handle)
 	if raw == "" {
 		return nil
 	}
