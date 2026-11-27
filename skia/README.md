@@ -43,7 +43,7 @@ cd ../.. && go test ./...
 GX 代码（外部符号小写，编译器还原大写）：
 
 ```gx
-import gxapp "github.com/robertpanvip/gox/runtime/app"
+import gxapp "github.com/robertpanvip/gox-sample/runtime/app"
 import skia "github.com/robertpanvip/gox-backend-skia"
 
 skia.run({ title: "Demo", width: 800, height: 600 }, () =>
@@ -107,9 +107,9 @@ _ = w.DrawLog() // 最近一帧的绘制指令（观测面）
 ## 切到独立仓库
 
 1. 把本 `skia/` 目录整体移到新仓库 `gox-skia-backend`。
-2. 编辑 `go.mod`：删除 `replace github.com/robertpanvip/gox => ../..`，把 host 依赖改为固定版本：
+2. 编辑 `go.mod`：删除 `replace github.com/robertpanvip/gox-sample => ../..`，把 host 依赖改为固定版本：
    ```
-   require github.com/robertpanvip/gox vX.Y.Z
+   require github.com/robertpanvip/gox-sample vX.Y.Z
    ```
 3. `go mod tidy && go test ./...`。
 

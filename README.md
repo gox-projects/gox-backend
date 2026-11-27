@@ -1,6 +1,6 @@
 # gox-backend
 
-GOX 的渲染后端实现仓。从 [gox](https://github.com/robertpanvip/gox) 仓拆出，与 [gox-core](https://github.com/robertpanvip/gox-core) 共同构成三仓布局。
+GOX 的渲染后端实现仓。从 [gox](https://github.com/robertpanvip/gox-sample) 仓拆出，与 [gox-core](https://github.com/robertpanvip/gox-core) 共同构成三仓布局。
 
 ## 目录结构
 
