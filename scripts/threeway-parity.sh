@@ -21,18 +21,18 @@ WEB_RC=1
 RUST_RC=1
 
 # 1) Skia：无头 Window 渲染 → DrawLog/命中框 观测面
-if (cd "$ROOT/backend/skia" && GX_THREEWAY_OUT="$OUT_DIR/out-skia.json" \
+if (cd "$ROOT/skia" && GX_THREEWAY_OUT="$OUT_DIR/out-skia.json" \
     go test -count=1 -run TestThreeWayMatrix . ) ; then SKIA_RC=0; fi
 
 # 2) Web：memDriver 镜像消费 → 样式透传 + css 转换断言
-if (cd "$ROOT/backend/web" && GX_THREEWAY_OUT="$OUT_DIR/out-web.json" \
+if (cd "$ROOT/web" && GX_THREEWAY_OUT="$OUT_DIR/out-web.json" \
     go test -count=1 -run 'TestThreeWayMatrixWeb|TestFlexDefaultColumn' . ) ; then WEB_RC=0; fi
 
 # 3) Rust：GRX 同源消费 → Taffy 布局 + 绘制指令 + 命中框 观测面
 RUSTCargo="$(ls -d "$HOME"/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin 2>/dev/null || true)"
 if [ -n "$RUSTCargo" ]; then export PATH="$RUSTCargo:$PATH"; fi
 if GX_THREEWAY_OUT="$OUT_DIR/out-rust.json" \
-   cargo test --manifest-path "$ROOT/backend/rust/rust/Cargo.toml" threeway_matrix ; then RUST_RC=0; fi
+   cargo test --manifest-path "$ROOT/rust/rust/Cargo.toml" threeway_matrix ; then RUST_RC=0; fi
 
 # 4) 汇总矩阵报告
 python3 - "$OUT_DIR" "$QUIET" <<'PYEOF'

@@ -4,7 +4,7 @@ package compat
 //
 // 迁移到纯 Go canvas 后，桌面窗口改为「CPU raster 绘制 → 上传纹理 → blit」架构：
 // canvas 负责 CPU 光栅化，GL 纹理/blit 由窗口层（glwindow）用 go-gl 完成。
-// 因此这里保留旧 API 的名字/形状让 backend/skia 与窗口代码兼容，但内部退化为
+// 因此这里保留旧 API 的名字/形状让 skia 与窗口代码兼容，但内部退化为
 // CPU raster surface——不再需要 Skia GL context / backend render target。
 
 type GrGLInterface struct{}

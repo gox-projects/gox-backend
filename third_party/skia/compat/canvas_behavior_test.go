@@ -5,7 +5,7 @@ import (
 )
 
 // 本文件固化导出 Canvas 的行为契约。compat 是纯 Go canvas 对 go-skia API 的兼容层，
-// backend/skia 的绘制与桌面脏矩形重绘都依赖下面这些语义。用像素级断言验证，而不是
+// skia 的绘制与桌面脏矩形重绘都依赖下面这些语义。用像素级断言验证，而不是
 // 只测"调用不崩"——历史上曾因仅靠源码推断 Clear/ClipRect 在 Scale 下的语义而误判。
 //
 // 像素布局：Pixmap 是 RGBA8888（内存字节序 R,G,B,A），RGBA8888Bytes() 按此顺序返回；

@@ -1,6 +1,6 @@
 # gx_gpu —— GX 独立 GPU 渲染管线（quad 管线）
 
-从 Rust 桌面后端（`backend/rust`）抽离的独立渲染 crate。**不依赖 GX 场景协议、
+从 Rust 桌面后端（`rust`）抽离的独立渲染 crate。**不依赖 GX 场景协议、
 布局或任何 GX 模块**，只消费一帧 GPU 形状的绘制指令（`GpuFrame`）。
 
 ## 三条架构约束
@@ -22,8 +22,8 @@
    GPU 构建下适配器不可用直接报错返回，不静默回退。API（`GpuFrame` /
    C ABI）在两种构建下完全一致，调用方代码零改动。
 3. **独立抽离**：三种消费方式——
-   - **rlib**：Rust 后端（`backend/rust`）`use gx_gpu` 直接驱动；
-   - **staticlib**：Go 侧 CGO（含 `backend/skia` 的 Go 桌面端）链接
+   - **rlib**：Rust 后端（`rust`）`use gx_gpu` 直接驱动；
+   - **staticlib**：Go 侧 CGO（含 `skia` 的 Go 桌面端）链接
      `libgx_gpu.a`，按 `gx_gpu.h` 调用；
    - **staticlib**：Android NDK 经 JNI 直调同一份 C ABI
      （`ANativeWindow*` 句柄已接通）。

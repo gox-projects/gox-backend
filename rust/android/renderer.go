@@ -2,7 +2,7 @@
 
 package androidbackend
 
-// V2 渲染内核的 cgo 绑定：gx_android_* C ABI（定义见 backend/rust/rust/src/
+// V2 渲染内核的 cgo 绑定：gx_android_* C ABI（定义见 rust/rust/src/
 // android_abi.rs）+ ANativeWindow 的 JNI 提取（native_window_jni.c）。
 //
 // 生命周期契约：surface 随 Activity 可见性销毁重建。OnSurfaceReady 注入/

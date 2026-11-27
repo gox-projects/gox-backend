@@ -85,21 +85,21 @@ CPU 前置管线 Rust 约快 2×。但两边的**实际光栅化/文本绘制**�
 
 ```bash
 # Rust 侧（解析→建树→Taffy 布局→指令，含 Go 编码输入）
-cd backend/rust/go
+cd rust/go
 GOWORK=off CGO_ENABLED=1 go test -run '^$' -bench BenchmarkRustParseLayout -benchtime=1s .
 
 # Go/Skia 侧（Yoga 布局）
-cd backend/skia
+cd skia
 GOWORK=off go test -run '^$' -bench BenchmarkSkiaLayout -benchtime=1s .
 
 # Go 侧 GRX1 编码
-cd backend/rust/go
+cd rust/go
 GOWORK=off CGO_ENABLED=1 go test -run '^$' -bench BenchmarkGXEncode -benchtime=1s .
 ```
 
 基准源码：
-- `backend/rust/go/bench_test.go`
-- `backend/skia/bench_test.go`
+- `rust/go/bench_test.go`
+- `skia/bench_test.go`
 - Rust 纯 CPU 入口：`render.rs::bench_frame` + C ABI `gx_bench_frame`
 
 ---
@@ -180,7 +180,7 @@ GOWORK=off CGO_ENABLED=1 go test -run '^$' -bench BenchmarkGXEncode -benchtime=1
 ## 复现（补充部分）
 
 ```bash
-cd backend/rust/rust
+cd rust/rust
 
 # B: Rust 冷编译（独立 target 目录，不破坏现有库）
 CARGO_TARGET_DIR=/tmp/gx-clean-target bash -c 'rm -rf /tmp/gx-clean-target; \
@@ -195,11 +195,11 @@ GOWORK=off GOCACHE=/tmp/emptycache go build -o /tmp/demo2 .   # 冷缓存
 
 # A: 体积
 cd ../../../../   # 回到仓库根，或直接用绝对路径
-ls -l backend/rust/rust/target/release/libgxbackend_rust.a
+ls -l rust/rust/target/release/libgxbackend_rust.a
 strip -c /tmp/demo && ls -l /tmp/demo       # strip 前后
 
 # C: 启动时间（需 Xvfb + llvmpipe）
-cd backend/rust/go
+cd rust/go
 GOWORK=off CGO_ENABLED=1 go build -o /tmp/startupbench ./cmd/startupbench
 Xvfb :99 -screen 0 1280x800x24 & XPID=$!; sleep 1
 for i in 1 2 3 4 5; do
@@ -217,7 +217,7 @@ kill $XPID
 
 渲染路径已从「tiny-skia CPU 全帧光栅 → 纹理上传 → blit」升级为
 「GpuFrame 纯数据 → gx_gpu GPU quad 管线（instanced + SDF shader）→ 同 pass
-叠加 glyphon 文本」。独立 crate 见 `backend/gpu`（GPU 优先 / 打包期可选 CPU
+叠加 glyphon 文本」。独立 crate 见 `gpu`（GPU 优先 / 打包期可选 CPU
 接管，三端一套 WGSL）。
 
 - 旧管线每帧上传整屏位图（1280×800 ≈ 4MB/帧 @PCIe）；新管线仅上传实例数据

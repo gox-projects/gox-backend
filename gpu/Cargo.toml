@@ -18,8 +18,8 @@ edition = "2021"
 # 调用方（Rust 后端 / Go CGO / Android NDK）只面向 GPU 形状的 API 编码。
 #
 # 独立抽离约束：本 crate 不依赖 GX 场景协议与任何 GX 模块，只消费 GpuFrame。
-#   1) rlib     —— Rust 后端（backend/rust）直接 use gx_gpu；
-#   2) staticlib —— Go 侧 CGO（含 backend/skia 的 Go 桌面端）经 gx_gpu.h 链接；
+#   1) rlib     —— Rust 后端（rust）直接 use gx_gpu；
+#   2) staticlib —— Go 侧 CGO（含 skia 的 Go 桌面端）经 gx_gpu.h 链接；
 #   3) staticlib —— Android NDK 经 JNI/NDK 直调同一份 C ABI。
 #
 # 颜色语义：全链路 sRGB 编码值（0..255），混合发生在 gamma 空间——与

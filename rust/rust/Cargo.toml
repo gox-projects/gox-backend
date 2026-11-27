@@ -20,7 +20,7 @@ cosmic-text = "0.14"
 pollster = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# GPU quad 渲染管线（独立 crate backend/gpu：GPU 优先 / 打包期可选 CPU 接管）
+# GPU quad 渲染管线（独立 crate gpu：GPU 优先 / 打包期可选 CPU 接管）
 gx_gpu = { path = "../../gpu" }
 # 桌面剪贴板（阶段 4 翻译层 Ctrl+C/V/X 消费）。wasm 构建必须 --no-default-features
 # （arboard 不支持 wasm32，会拉爆编译）。

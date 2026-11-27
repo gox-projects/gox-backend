@@ -2,9 +2,9 @@ go 1.27.2
 
 use (
 	../gox-core
-	./backend/rust/go
-	./backend/rust/android
-	./backend/skia
-	./backend/web
+	./rust/go
+	./rust/android
+	./skia
+	./web
 	./third_party/skia
 )

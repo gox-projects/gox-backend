@@ -1,7 +1,7 @@
 // Package compat 提供与 github.com/pekim/go-skia v0.1.0 同形的 API 外观，
 // 内部委托给纯 Go 的 Skia 渲染库 github.com/richardwilkes/canvas。
 //
-// 目的：让 GoX 的 backend/skia 绘制层与真实 GL 窗口只需改 import 路径，
+// 目的：让 GoX 的 skia 绘制层与真实 GL 窗口只需改 import 路径，
 // 即可用纯 Go canvas（零 cgo 静态库、9MB module）替换掉带 55MB libskia.a
 // 的 fork 绑定，同时保留旧 API 的值类型语义（Rect/Font/Image 等为 struct 值）。
 //
@@ -174,7 +174,7 @@ func NewRadialGradientShader(center Point, radius float32, colors []Color, posit
 	)}
 }
 
-// MaskFilter / ImageFilter：backend/skia 未使用，保留真实接口类型以兼容旧 API。
+// MaskFilter / ImageFilter：skia 未使用，保留真实接口类型以兼容旧 API。
 type MaskFilter struct{ p maskfilter.MaskFilter }
 func (f MaskFilter) IsNil() bool { return f.p == nil }
 

@@ -4,9 +4,9 @@ GO := go
 TOOLCHAIN := GOTOOLCHAIN=go1.27.4
 
 # 本仓含 Go 源码的模块（顶层无 module，仅 go.work 容器）。
-MODULES := backend/rust/go backend/skia backend/web third_party/skia
+MODULES := rust/go skia web third_party/skia
 # Rust 静态库构建脚本（cgo 链接需要）。
-RUST_BUILD := backend/rust/rust/build.sh
+RUST_BUILD := rust/rust/build.sh
 
 .PHONY: build test test-rust clean all
 
@@ -34,9 +34,9 @@ test:
 
 ## test-rust: Rust crate 测试
 test-rust:
-	cargo test --manifest-path backend/rust/rust/Cargo.toml
-	cargo test --manifest-path backend/gpu/Cargo.toml
+	cargo test --manifest-path rust/rust/Cargo.toml
+	cargo test --manifest-path gpu/Cargo.toml
 
 ## clean: 清理 Rust 构建产物
 clean:
-	rm -rf backend/rust/rust/target backend/gpu/target
+	rm -rf rust/rust/target gpu/target

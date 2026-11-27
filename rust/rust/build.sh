@@ -7,7 +7,7 @@
 # 之后必须用 objcopy 把这两个 section 剥离——剥离只移除给 LTO 用的中间表示，
 # 机器码不受影响，运行行为与优化级别不变。
 #
-# 用法（在任意目录）：bash backend/rust/rust/build.sh
+# 用法（在任意目录）：bash rust/rust/build.sh
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

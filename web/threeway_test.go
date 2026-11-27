@@ -13,7 +13,7 @@ package gxweb
 // 真实布局发生在浏览器里，headless native 不可测——浏览器侧行为由 cssName /
 // cssValue / flexDefaultColumn 的单测 + 真实浏览器预览覆盖。
 //
-// 运行：go test ./backend/web -run TestThreeWayMatrixWeb
+// 运行：go test ./web -run TestThreeWayMatrixWeb
 // GX_THREEWAY_OUT 指定观测结果 JSON 输出路径（scripts/threeway-parity.sh 用）。
 
 import (
@@ -114,7 +114,7 @@ func twLoadCasesWeb(t *testing.T) twSuiteWeb {
 	t.Helper()
 	path := os.Getenv("GX_THREEWAY_CASES")
 	if path == "" {
-		path = "../../testdata/threeway/cases.json"
+		path = "../testdata/threeway/cases.json"
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {

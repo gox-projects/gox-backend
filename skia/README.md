@@ -11,7 +11,7 @@
 ## 目录结构
 
 ```
-backend/skia/
+skia/
   go.mod         独立 module（github.com/robertpanvip/gox-backend-skia）
   linkflags.go   修复上游 go-skia 的静态库链接顺序 bug（Linux）
   window.go      gxapp.Window 实现 + DrawLog 观测面
@@ -27,7 +27,7 @@ backend/skia/
 
 ```bash
 # 后端测试（真 Skia CGO）
-cd backend/skia && go test ./...
+cd skia && go test ./...
 
 # host 全量回归（不受 go.work 影响）
 cd ../.. && go test ./...
@@ -79,7 +79,7 @@ _ = w.DrawLog() // 最近一帧的绘制指令（观测面）
 
 ## 预制控件库（`widgets` 子包）
 
-`backend/skia/widgets` 提供一组跨后端通用的预制组件。组件是纯函数 `func(gxscene.Props) *gxscene.Instance`，产出「带样式属性的场景树」，后端零侵入；所有交互组件都是**受控**的：业务用 signal 持有状态，通过 `Bind*` 把 setter 包装成事件 handler 回传。
+`skia/widgets` 提供一组跨后端通用的预制组件。组件是纯函数 `func(gxscene.Props) *gxscene.Instance`，产出「带样式属性的场景树」，后端零侵入；所有交互组件都是**受控**的：业务用 signal 持有状态，通过 `Bind*` 把 setter 包装成事件 handler 回传。
 
 **视觉风格贴近 Apple HIG 深色模式**：中性灰系统色分层（窗口/分组/卡片/填充）、系统语义色（蓝/绿/红/橙/紫…）、连续大圆角、柔和多层阴影、`#rrggbbaa` 半透明材质近似毛玻璃、8pt 间距标度。常量集中在 `apple_theme.go`（`Apple*` / `Radius*` / `Shadow*` / `Space*`）；`Theme*` 保留旧名兼容业务，取值指向 Apple 系统色。详见 [docs/APPLE_DESIGN.md](../../docs/APPLE_DESIGN.md)。
 
@@ -106,7 +106,7 @@ _ = w.DrawLog() // 最近一帧的绘制指令（观测面）
 
 ## 切到独立仓库
 
-1. 把本 `backend/skia/` 目录整体移到新仓库 `gox-skia-backend`。
+1. 把本 `skia/` 目录整体移到新仓库 `gox-skia-backend`。
 2. 编辑 `go.mod`：删除 `replace github.com/robertpanvip/gox => ../..`，把 host 依赖改为固定版本：
    ```
    require github.com/robertpanvip/gox vX.Y.Z
@@ -142,7 +142,7 @@ _ = w.DrawLog() // 最近一帧的绘制指令（观测面）
 | `Draw`（每帧全量 snapshotTree） | ~2,180,000 | 1,858,212 | 23,067 |
 | `Present`（O(1) 快速复用） | ~35,000 | 155,648 | 2 |
 
-约 **62× 快、11,553× 少分配**。复跑：`go test ./backend/skia -run '^$' -bench BenchmarkNoChangeFrame -benchmem`。
+约 **62× 快、11,553× 少分配**。复跑：`go test ./skia -run '^$' -bench BenchmarkNoChangeFrame -benchmem`。
 
 ## 桌面 glWindow 的两级增量
 

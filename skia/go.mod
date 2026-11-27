@@ -2,7 +2,7 @@ module github.com/robertpanvip/gox-backend-skia
 
 go 1.27
 
-replace github.com/robertpanvip/gox-core => ../../../gox-core
+replace github.com/robertpanvip/gox-core => ../../gox-core
 
 require (
 	github.com/ahati/yoga-go-binding v0.1.0
@@ -10,4 +10,4 @@ require (
 	github.com/robertpanvip/gox-skia v0.0.0
 )
 
-replace github.com/robertpanvip/gox-skia => ../../third_party/skia
+replace github.com/robertpanvip/gox-skia => ../third_party/skia

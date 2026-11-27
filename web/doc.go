@@ -1,6 +1,6 @@
 // Package gxweb 是 gox 的浏览器（WebAssembly）后端。
 //
-// 它和 backend/skia、backend/rust/go 一样是一个**独立 Go module**，实现 gxapp 的
+// 它和 skia、rust/go 一样是一个**独立 Go module**，实现 gxapp 的
 // Backend Contract：gxapp.Window + gxapp.FramePresenter，以及可选的 Focuser /
 // Measurer / ComputedStyler。核心 runtime 不 import 它；装配层（main）通过
 // OpenWith / gxapp.Register 注入。

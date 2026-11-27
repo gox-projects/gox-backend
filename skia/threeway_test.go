@@ -6,7 +6,7 @@ package skia
 //
 // 运行方式：
 //
-//	go test ./backend/skia -run TestThreeWayMatrix
+//	go test ./skia -run TestThreeWayMatrix
 //
 // 环境变量（可选）：GX_THREEWAY_CASES 覆盖用例路径；
 // GX_THREEWAY_OUT 指定观测结果 JSON 输出路径（scripts/threeway-parity.sh 汇总用）。
@@ -64,7 +64,7 @@ func twLoadCases(t *testing.T) twSuite {
 	t.Helper()
 	path := os.Getenv("GX_THREEWAY_CASES")
 	if path == "" {
-		path = "../../testdata/threeway/cases.json"
+		path = "../testdata/threeway/cases.json"
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
