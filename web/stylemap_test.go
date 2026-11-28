@@ -327,3 +327,46 @@ func TestAnimationDurationFallback(t *testing.T) {
 		}
 	}
 }
+
+// ===== 跨层契约：fixture 为 gox-core Style.Props() 真实产出 =====
+
+const goxcoreKeyframesFixture = `[{"offset":"0","props":{"bg":"#000000","opacity":"0","transform":"translateX(-100px)"}},{"offset":"0.5","props":{"opacity":"0.5"}},{"offset":"1","props":{"bg":"#ffffff","opacity":"1","transform":"translateX(0px)"}}]`
+
+func TestContractGoxcoreFixtureKeyframesCSS(t *testing.T) {
+	got := buildKeyframesCSS(goxcoreKeyframesFixture, "gx-kf-contract")
+	// 三帧、属性映射（bg→background-color）、offset→百分比。
+	for _, frag := range []string{
+		"@keyframes gx-kf-contract {",
+		"0%{", "50%{", "100%{",
+		"opacity:0;", "opacity:0.5;", "opacity:1;",
+		"background-color:#000000;", "background-color:#ffffff;",
+		"transform:translateX(-100px);", "transform:translateX(0px);",
+	} {
+		if !strings.Contains(got, frag) {
+			t.Errorf("真实 fixture 缺少片段 %q\n产出: %s", frag, got)
+		}
+	}
+}
+
+func TestContractNoNameShorthandDurationIterations(t *testing.T) {
+	// gox-core 无 name 自定义动画："2000ms 3" → 时长 2s、3 次。
+	got := animationCSSWithKeyframes("2000ms 3", "gx-kf-contract")
+	if got != "gx-kf-contract 2s linear 3" {
+		t.Errorf("无 name 有限次数 = %q", got)
+	}
+	got = animationCSSWithKeyframes("1.5s infinite", "gx-kf-contract")
+	if got != "gx-kf-contract 1.5s linear infinite" {
+		t.Errorf("无 name infinite = %q", got)
+	}
+}
+
+func TestContractOutOfOrderOffsetsCSS(t *testing.T) {
+	// CSS @keyframes 声明顺序无关，浏览器按 offset 排序；此处只需保证全部产出。
+	raw := `[{"offset":"1","props":{"opacity":"1"}},{"offset":"0","props":{"opacity":"0"}},{"offset":"0.5","props":{"opacity":"0.5"}}]`
+	got := buildKeyframesCSS(raw, "gx-kf-order")
+	for _, frag := range []string{"0%{", "50%{", "100%{", "opacity:0;", "opacity:0.5;", "opacity:1;"} {
+		if !strings.Contains(got, frag) {
+			t.Errorf("乱序帧缺少 %q: %s", frag, got)
+		}
+	}
+}

@@ -208,36 +208,66 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
     s.parse::<f64>().ok().map(|x| (x * 1000.0) as i64)
 }
 
+/// 从 animation 简写串的 token 解析 (duration_ms, iterations)，与是否带 name 无关。
+/// 正整数 token 视为 iterations，infinite 视为 -1，带单位/裸浮点视为 duration。
+fn parse_animation_timing(toks: &[&str]) -> (i64, i64) {
+    let mut duration_ms = 0i64;
+    let mut iterations = -1i64;
+    for t in toks {
+        if *t == "infinite" {
+            iterations = -1;
+            continue;
+        }
+        if let Ok(n) = t.parse::<i64>() {
+            if n > 0 {
+                iterations = n;
+                continue;
+            }
+        }
+        if let Some(d) = parse_duration_ms(t) {
+            if d > 0 {
+                duration_ms = d;
+            }
+        }
+    }
+    (duration_ms, iterations)
+}
+
 pub fn parse_animation(s: &str) -> Option<AnimationSpec> {
     let lowered = s.trim().to_ascii_lowercase();
     let toks: Vec<&str> = lowered.split_whitespace().collect();
     if toks.is_empty() || toks[0] != "blink" {
         return None;
     }
-    let mut spec = AnimationSpec {
-        duration_ms: 0,
-        iterations: -1,
-        keyframes: Vec::new(),
-    };
-    for t in &toks[1..] {
-        if *t == "infinite" {
-            spec.iterations = -1;
-            continue;
-        }
-        if let Ok(n) = t.parse::<i64>() {
-            if n > 0 {
-                spec.iterations = n;
-                continue;
-            }
-        }
-        if let Some(d) = parse_duration_ms(t) {
-            if d > 0 {
-                spec.duration_ms = d;
-            }
-        }
+    let (duration_ms, iterations) = parse_animation_timing(&toks[1..]);
+    if duration_ms > 0 {
+        Some(AnimationSpec {
+            duration_ms,
+            iterations,
+            keyframes: Vec::new(),
+        })
+    } else {
+        None
     }
-    if spec.duration_ms > 0 {
-        Some(spec)
+}
+
+/// 解析无内置 name 的自定义 animation 简写串。gox-core 的 AnimationStyle 在
+/// 内嵌 keyframes 时展平出的 animation 串形如 "2000ms 3"（无 name），此前
+/// 仅认 blink 的 parse_animation 会拒收，导致自定义动画的时长/次数静默丢失。
+/// 只在解析出有效 duration 时接受，避免把任意字符串误判为动画。
+fn parse_custom_animation(s: &str) -> Option<AnimationSpec> {
+    let lowered = s.trim().to_ascii_lowercase();
+    let toks: Vec<&str> = lowered.split_whitespace().collect();
+    if toks.is_empty() {
+        return None;
+    }
+    let (duration_ms, iterations) = parse_animation_timing(&toks);
+    if duration_ms > 0 {
+        Some(AnimationSpec {
+            duration_ms,
+            iterations,
+            keyframes: Vec::new(),
+        })
     } else {
         None
     }
@@ -280,6 +310,9 @@ fn parse_keyframes(json: &str) -> Vec<Keyframe> {
         }
         out.push(Keyframe { offset, props });
     }
+    // gox-core 编码关键帧时按书写顺序输出、不排序；采样器依赖 offset 升序定位
+    // 帧区间，故此处必须排序（稳定排序保留重复 offset 的原始先后）。
+    out.sort_by(|a, b| a.offset.partial_cmp(&b.offset).unwrap_or(std::cmp::Ordering::Equal));
     out
 }
 
@@ -299,7 +332,7 @@ pub fn animation_from_props(n: &SceneNode) -> Option<AnimationSpec> {
     let mut spec = n
         .props
         .get("animation")
-        .and_then(|s| parse_animation(s))
+        .and_then(|s| parse_animation(s).or_else(|| parse_custom_animation(s)))
         .unwrap_or(AnimationSpec {
             duration_ms: 1000,
             iterations: -1,
@@ -1777,6 +1810,130 @@ mod tests {
         let spec = animation_from_props(&n).expect("应识别关键帧动画");
         assert_eq!(spec.duration_ms, 1000);
         assert_eq!(spec.keyframes.len(), 1);
+    }
+
+    // ===== 跨层契约：fixture 为 gox-core Style.Props() 真实产出 =====
+    // gox-core 的 AnimationStyle（自定义关键帧、无内置 name）展平后：
+    //   animation           = "2000ms 3"
+    //   animation-keyframes = [{"offset":"0","props":{...}},{"offset":"0.5",...},{"offset":"1",...}]
+    // 简写串无 "blink" 前缀，Rust 必须仍能解析出 duration/iterations，
+    // 否则自定义动画的时长与次数会静默丢失，被默认 1000ms/infinite 覆盖。
+
+    #[test]
+    fn contract_custom_animation_no_name_parses_duration_and_iterations() {
+        let n = node(&[
+            ("animation", "2000ms 3"),
+            (
+                "animation-keyframes",
+                r##"[{"offset":"0","props":{"opacity":"0"}},{"offset":"1","props":{"opacity":"1"}}]"##,
+            ),
+        ]);
+        let spec = animation_from_props(&n).expect("自定义关键帧动画应被识别");
+        assert_eq!(spec.duration_ms, 2000, "无 name 简写串的 duration 必须解析");
+        assert_eq!(spec.iterations, 3, "无 name 简写串的 iterations 必须解析");
+        assert_eq!(spec.keyframes.len(), 2);
+    }
+
+    #[test]
+    fn contract_custom_animation_seconds_unit_and_infinite() {
+        let n = node(&[
+            ("animation", "1.5s infinite"),
+            (
+                "animation-keyframes",
+                r##"[{"offset":"0","props":{"opacity":"0"}},{"offset":"1","props":{"opacity":"1"}}]"##,
+            ),
+        ]);
+        let spec = animation_from_props(&n).expect("自定义关键帧动画应被识别");
+        assert_eq!(spec.duration_ms, 1500, "秒单位时长须解析");
+        assert_eq!(spec.iterations, -1, "infinite 须解析为 -1");
+    }
+
+    #[test]
+    fn contract_real_goxcore_json_parses_all_props() {
+        // gox-core 真实编码：props 键是 kebab/短名（bg/opacity/transform）。
+        let n = node(&[
+            ("animation", "1000ms -1"),
+            (
+                "animation-keyframes",
+                r##"[{"offset":"0","props":{"bg":"#000000","opacity":"0","transform":"translateX(-100px)"}},{"offset":"0.5","props":{"opacity":"0.5"}},{"offset":"1","props":{"bg":"#ffffff","opacity":"1","transform":"translateX(0px)"}}]"##,
+            ),
+        ]);
+        let spec = animation_from_props(&n).expect("应识别");
+        assert_eq!(spec.keyframes.len(), 3);
+        assert_eq!(spec.keyframes[0].props.get("opacity").unwrap(), "0");
+        assert_eq!(spec.keyframes[0].props.get("bg").unwrap(), "#000000");
+        assert_eq!(
+            spec.keyframes[0].props.get("transform").unwrap(),
+            "translateX(-100px)"
+        );
+        // 中点插值：opacity 0→1 在 t=0.5 应≈0.5。
+        let out = spec.sample_keyframes(500);
+        let op: f32 = out
+            .iter()
+            .find(|(k, _)| k == "opacity")
+            .map(|(_, v)| v.parse().unwrap())
+            .expect("应输出 opacity");
+        assert!((op - 0.5).abs() < 0.01, "t=0.5 opacity≈0.5, got {}", op);
+    }
+
+    #[test]
+    fn contract_out_of_order_offsets_sorted() {
+        // gox-core 不排序，开发者可能乱序书写；后端必须按 offset 排序后再采样。
+        let n = node(&[
+            ("animation", "1000ms -1"),
+            (
+                "animation-keyframes",
+                r##"[{"offset":"1","props":{"opacity":"1"}},{"offset":"0","props":{"opacity":"0"}},{"offset":"0.5","props":{"opacity":"0.5"}}]"##,
+            ),
+        ]);
+        let spec = animation_from_props(&n).expect("应识别");
+        assert_eq!(spec.keyframes[0].offset, 0.0, "首帧应是 offset=0");
+        assert_eq!(spec.keyframes[2].offset, 1.0, "末帧应是 offset=1");
+        let out = spec.sample_keyframes(500);
+        let op: f32 = out
+            .iter()
+            .find(|(k, _)| k == "opacity")
+            .map(|(_, v)| v.parse().unwrap())
+            .expect("应输出 opacity");
+        assert!((op - 0.5).abs() < 0.01, "乱序输入中点 opacity≈0.5, got {}", op);
+    }
+
+    #[test]
+    fn contract_duplicate_offsets_no_panic() {
+        // 重复 offset（span=0）不得 panic，也不得除零产生 NaN。
+        let n = node(&[
+            ("animation", "1000ms -1"),
+            (
+                "animation-keyframes",
+                r##"[{"offset":"0.5","props":{"opacity":"0"}},{"offset":"0.5","props":{"opacity":"1"}}]"##,
+            ),
+        ]);
+        let spec = animation_from_props(&n).expect("应识别");
+        let out = spec.sample_keyframes(500);
+        for (_, v) in out {
+            assert!(!v.contains("NaN"), "不得产出 NaN: {}", v);
+        }
+    }
+
+    #[test]
+    fn contract_numeric_offset_and_prop_values() {
+        // gox-core 的 offset 编码为字符串，但后端也应容忍数字（历史/手写路径）。
+        let n = node(&[
+            ("animation", "1000ms -1"),
+            (
+                "animation-keyframes",
+                r##"[{"offset":0,"props":{"opacity":0}},{"offset":1,"props":{"opacity":1}}]"##,
+            ),
+        ]);
+        let spec = animation_from_props(&n).expect("应识别");
+        assert_eq!(spec.keyframes.len(), 2);
+        let out = spec.sample_keyframes(500);
+        let op: f32 = out
+            .iter()
+            .find(|(k, _)| k == "opacity")
+            .map(|(_, v)| v.parse().unwrap())
+            .expect("应输出 opacity");
+        assert!((op - 0.5).abs() < 0.01, "数字 offset/prop 中点≈0.5, got {}", op);
     }
 }
 
