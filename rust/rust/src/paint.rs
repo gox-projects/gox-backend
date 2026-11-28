@@ -41,6 +41,17 @@ pub(crate) fn is_portal(n: &crate::scene::SceneNode) -> bool {
 pub(crate) fn is_scrim(n: &crate::scene::SceneNode) -> bool {
     gx_role(n) == "scrim"
 }
+/// 浮层坐标覆盖表的身份 key：GRX3 帧所有节点的字符串 id 都是空串
+/// （整数身份走 nid），若用 id 做 key 会让 scrim/modal/portal 全部落到
+/// 同一个 "" 槽互相覆盖——表现为遮罩起点错位到面板、浮层文字挤在一起。
+/// 因此整数身份优先，字符串 id 仅作 GRX1/测试的兜底。
+fn ov_key(n: &crate::scene::SceneNode) -> String {
+    if n.nid != 0 {
+        format!("n{}", n.nid)
+    } else {
+        format!("s{}", n.id)
+    }
+}
 /// 内容型浮层（非遮罩）：统一在 scrim 之后绘制。
 pub(crate) fn is_content_overlay(n: &crate::scene::SceneNode) -> bool {
     is_popover(n) || is_modal(n) || is_portal(n)
@@ -1223,26 +1234,29 @@ impl DisplayList {
             &mut dl.node_boxes,
         );
 
-        // 计算每个浮层的目标绝对左上角，按 node.id 索引（emit 时套用）。
+        // 计算每个浮层的目标绝对左上角，按整数身份索引（emit 时套用）。
+        // 注意：GRX3 帧的字符串 id 全为空串，必须用 nid 区分各浮层。
         let mut overrides: std::collections::HashMap<String, (f32, f32)> =
             std::collections::HashMap::new();
         for ov in &overlays {
             if is_scrim(ov.node) {
-                overrides.insert(ov.node.id.clone(), (0.0, 0.0)); // 遮罩铺满，尺寸在 emit 时按画布覆盖
+                overrides.insert(ov_key(ov.node), (0.0, 0.0)); // 遮罩铺满，尺寸在 emit 时按画布覆盖
                 continue;
             }
             if is_modal(ov.node) {
                 // 视口居中（无锚点），与 Skia 端一致。
                 overrides.insert(
-                    ov.node.id.clone(),
+                    ov_key(ov.node),
                     place_centered(ov.w, ov.h, avail_w, avail_h),
                 );
                 continue;
             }
             if is_portal(ov.node) {
-                // 传送门根平移到画布原点（子树坐标随之相对画布左上角）。
-                // portal 根自身透明，负坐标无视觉影响；与 Skia 端"子树平移到原点"对齐。
-                overrides.insert(ov.node.id.clone(), (-ov.x, -ov.y));
+                // 传送门根锚定画布原点：emit 的 override 直接作为绝对坐标使用，
+                // 子树用 position:absolute + left/top 相对画布定位（如 top=955）。
+                // 旧实现写 (-ov.x, -ov.y) 是双重平移——子树坐标本就相对画布，
+                // 再减根在主树里的偏移会把浮层推到画布外（top=955 被算到顶部）。
+                overrides.insert(ov_key(ov.node), (0.0, 0.0));
                 continue;
             }
             if !is_popover(ov.node) {
@@ -1268,7 +1282,7 @@ impl DisplayList {
                     );
                 }
             }
-            overrides.insert(ov.node.id.clone(), target);
+            overrides.insert(ov_key(ov.node), target);
         }
 
         // ---- emit：主树（跳过浮层）→ 遮罩 → 浮层，保证绘制层级 ----
@@ -1337,7 +1351,7 @@ impl DisplayList {
             let lay = ctx.taffy.layout(tnode).expect("taffy layout");
             // 浮层根用第二遍算出的目标坐标；其余节点沿用 Taffy 相对坐标累加。
             let (x, y) = overrides
-                .get(&node.id)
+                .get(&ov_key(node))
                 .copied()
                 .unwrap_or((ox + lay.location.x, oy + lay.location.y));
             let mut w = lay.size.width;
@@ -1420,7 +1434,12 @@ impl DisplayList {
 
             if node.typ == NodeType::Div {
                 let bg_raw = p("bg").or_else(|| p("background"));
-                let bg = bg_raw.map(parse_color);
+                // 8 位 hex（如 #00000099 遮罩）携带 alpha，必须保留并乘进
+                // shape alpha；旧实现用 parse_color 丢掉 alpha，导致 Modal
+                // scrim 变成完全不透明的纯黑、盖住整页背景。
+                let bg_rgba = bg_raw.and_then(crate::style::parse_color_rgba);
+                let bg = bg_rgba.map(|(r, g, b, _)| (r, g, b));
+                let bg_alpha = bg_rgba.map(|(_, _, _, a)| a as f32 / 255.0).unwrap_or(1.0);
                 // 通用渐变背景：带 gradient-text 标记的节点渐变只作用于文字，
                 // 不画背景（与 Go paint.go 的例外一致）；其余节点的 bg 渐变画到容器。
                 let is_gradient_text = node
@@ -1487,7 +1506,7 @@ impl DisplayList {
                         clip: my_clip,
                         img,
                         canvas,
-                        alpha: st.opacity,
+                        alpha: st.opacity * bg_alpha,
                         video: video_frame,
                         video_id: if is_video {
                             node_id_str(node)
@@ -1605,6 +1624,11 @@ impl DisplayList {
 
         // 帧开始：清空指令缓存 live 集（帧末 retain 淘汰滚出视口的子树）。
         cache.emit.begin_frame();
+        // 记录主树产出的文字区间起点：浮层（scrim/modal/portal）随后追加。
+        // 不透明浮层面板会遮挡下层文字，但 glyphon 统一在 quad 之后绘制所有
+        // 文字——若不剔除被面板覆盖的主树文字，它们会浮在面板之上（表现为
+        // 模态框里透出背景页文字）。帧末按浮层面板矩形剔除这些文字。
+        let main_text_start = dl.texts.len();
         // 第一遍：主树，跳过浮层子树。
         emit(
             root,
@@ -1652,6 +1676,8 @@ impl DisplayList {
             );
         }
         // 第三遍：内容浮层 popover → modal → portal（最上层），按角色分层保证层级稳定。
+        let content_shape_start = dl.shapes.len();
+        let content_text_start = dl.texts.len();
         for role in ["popover", "modal", "portal"] {
             for ov in overlays.iter().filter(|o| gx_role(o.node) == role) {
                 emit(
@@ -1676,6 +1702,28 @@ impl DisplayList {
                     &mut cache.emit,
                 );
             }
+        }
+        // 不透明浮层面板遮挡下层文字：glyphon 统一在 quad 之后画所有文字，
+        // 主树里落在面板矩形内的文字会透到面板上。收集第三遍浮层产出的
+        // 不透明 bg 矩形，剔除主树文字段中锚点被覆盖的项（浮层自身文字保留）。
+        let covers: Vec<(f32, f32, f32, f32)> = dl.shapes[content_shape_start..]
+            .iter()
+            .filter(|s| s.bg_present && s.alpha >= 0.85 && s.w > 0.0 && s.h > 0.0)
+            .map(|s| (s.x, s.y, s.w, s.h))
+            .collect();
+        if !covers.is_empty() {
+            let mut kept = Vec::with_capacity(dl.texts.len());
+            for (i, t) in dl.texts.drain(..).enumerate() {
+                let hidden = i >= main_text_start
+                    && i < content_text_start
+                    && covers.iter().any(|&(cx, cy, cw, ch)| {
+                        t.x >= cx && t.x < cx + cw && t.y >= cy && t.y < cy + ch
+                    });
+                if !hidden {
+                    kept.push(t);
+                }
+            }
+            dl.texts = kept;
         }
         // 帧结束：淘汰本帧未出现的槽（滚出视口 / 删除的子树）。
         cache.emit.end_frame();
@@ -2224,6 +2272,34 @@ mod overlay_tests {
         assert_eq!(x, 0.0);
         assert_eq!(y, 50.0);
     }
+
+    /// 回归：GRX3 帧所有节点的字符串 id 都是空串，浮层坐标覆盖表必须按
+    /// 整数 nid 区分，否则 scrim/modal/portal 全落到 "" 槽互相覆盖——
+    /// 表现为遮罩起点错位到面板、浮层文字挤在一起（skia-gallery 实测 bug）。
+    #[test]
+    pub(crate) fn overlay_key_uses_nid_when_string_id_empty() {
+        use crate::scene::SceneNode;
+        fn node(nid: u64, id: &str) -> SceneNode {
+            SceneNode {
+                typ: NodeType::Div, kind: "div".into(),
+                id: id.to_string(), nid,
+                text: String::new(), props: std::collections::HashMap::new(),
+                events: vec![], children: vec![],
+            }
+        }
+        // GRX3：不同 nid、id 全空 → key 必须不同
+        let a = node(5, "");
+        let b = node(6, "");
+        let c = node(7, "");
+        assert_ne!(ov_key(&a), ov_key(&b), "不同 nid 的空 id 节点 key 必须不同");
+        assert_ne!(ov_key(&b), ov_key(&c), "不同 nid 的空 id 节点 key 必须不同");
+        assert_eq!(ov_key(&a), ov_key(&node(5, "")), "同 nid key 稳定");
+        // GRX1 兜底：nid=0、id 非空 → 用字符串 id 区分
+        let g1 = node(0, "modal-1");
+        let g2 = node(0, "portal-1");
+        assert_ne!(ov_key(&g1), ov_key(&g2), "GRX1 应回退到字符串 id");
+    }
+
 }
 
 #[cfg(test)]
