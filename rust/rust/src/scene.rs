@@ -126,7 +126,11 @@ impl SceneNode {
 //   o+32 key_off u32 | o+36 blob_off u32 | o+40 val_off u32 | o+44 blob_len u32
 
 const DELTA_MAGIC: u32 = 0x3258_5247; // "GRX2"
-const DELTA_MAGIC_V3: u32 = 0x3358_5247; // "GRX3"
+// GRX3 增量帧独立 magic（"GRX3D"）：全量帧占用 0x3358_5247。二者若共用，
+// Renderer::apply_frame 先试 FrameView::parse 会把增量帧误判为全量快照，
+// 字段错位后 pool_str 读越界 offset → panic 杀死事件泵线程（GUI E2E 场景
+// 10 之后所有交互失效的根因）。与 Go 侧 deltaMagicV3 同步。
+const DELTA_MAGIC_V3: u32 = 0x3358_5248;
 const DELTA_HEADER: usize = 16;
 const ACTION_SZ: usize = 24;
 const ACTION_SZ_V3: usize = 48;
@@ -138,16 +142,26 @@ const ACT_REMOVE_CHILD: u8 = 4;
 const ACT_MOVE_CHILD: u8 = 5;
 const ACT_REPLACE_CHILDREN: u8 = 6;
 
+// 与 binprotocol.rs 同理：解析在事件泵线程，越界绝不 panic。
 fn u32at(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    let s = match b.get(o..o + 4) {
+        Some(s) => s,
+        None => return 0,
+    };
+    u32::from_le_bytes([s[0], s[1], s[2], s[3]])
 }
 fn u16at(b: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes([b[o], b[o + 1]])
+    let s = match b.get(o..o + 2) {
+        Some(s) => s,
+        None => return 0,
+    };
+    u16::from_le_bytes([s[0], s[1]])
 }
 fn u64at(b: &[u8], o: usize) -> u64 {
-    let mut a = [0u8; 8];
-    a.copy_from_slice(&b[o..o + 8]);
-    u64::from_le_bytes(a)
+    match b.get(o..o + 8) {
+        Some(s) => u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]),
+        None => 0,
+    }
 }
 
 /// 解码后的统一动作意图（GRX2 字符串 id → parse 成 u64；GRX3 直读 u64）。
@@ -201,7 +215,11 @@ impl<'a> DeltaView<'a> {
     fn pool_str(&self, off: u32) -> &'a str {
         let o = self.pool_off + off as usize;
         let len = u16at(self.buf, o) as usize;
-        std::str::from_utf8(&self.buf[o + 2..o + 2 + len]).unwrap_or("")
+        let s = match self.buf.get(o + 2..o + 2 + len) {
+            Some(s) => s,
+            None => return "",
+        };
+        std::str::from_utf8(s).unwrap_or("")
     }
 
     /// 从 blob 区解析一棵内嵌子树（GRX1/GRX3 迷你帧）。
@@ -218,7 +236,10 @@ impl<'a> DeltaView<'a> {
     /// 解码第 i 条动作（按协议版本分派读取，输出统一意图）。
     fn action(&self, i: usize) -> Option<ActionIntent> {
         let o = DELTA_HEADER + i * self.action_sz;
-        let kind = self.buf[o];
+        let kind = match self.buf.get(o) {
+            Some(k) => *k,
+            None => return None,
+        };
         let (node_raw, child_raw, before_raw, key_off, blob_off, val_off, blob_len) =
             if self.action_sz == ACTION_SZ_V3 {
                 (
@@ -638,7 +659,7 @@ mod tests {
         }
         let total = 16 + act_bytes.len() + pool.len() + blob.len();
         let mut buf = vec![0u8; total];
-        put32(&mut buf, 0, 0x3358_5247);
+        put32(&mut buf, 0, DELTA_MAGIC_V3); // GRX3D：独立于全量帧的 magic
         put32(&mut buf, 4, 100);
         put32(&mut buf, 8, actions.len() as u32);
         put32(&mut buf, 12, pool.len() as u32);

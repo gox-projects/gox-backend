@@ -48,8 +48,10 @@ pub struct QuadGpu {
     screen_buf: wgpu::Buffer,
     tex_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    /// 纹理注册表：id → (texture, bind_group, content key)。
-    textures: HashMap<u32, (wgpu::Texture, wgpu::BindGroup, u64)>,
+    /// 纹理注册表：id → (texture, bind_group, content key, width, height, premul)。
+    /// 尺寸与 premul 随纹理常驻：Prim::Tex 只带 id/uv，跨帧复用时本帧 uploads
+    /// 不含该 id，实例构造必须从缓存取这两个值填 WGSL 的 misc.zw / flags.x。
+    textures: HashMap<u32, (wgpu::Texture, wgpu::BindGroup, u64, f32, f32, f32)>,
     quad_cap: usize,
     tex_cap: usize,
 }
@@ -222,7 +224,7 @@ impl QuadGpu {
     /// 上传/更新纹理（按 id + key 去重；内容未变时跳过 GPU 拷贝）。
     pub fn sync_textures(&mut self, frame: &GpuFrame) {
         for up in &frame.uploads {
-            if self.textures.get(&up.id).map(|(_, _, k)| *k == up.key).unwrap_or(false) {
+            if self.textures.get(&up.id).map(|(_, _, k, _, _, _)| *k == up.key).unwrap_or(false) {
                 continue;
             }
             let size = wgpu::Extent3d {
@@ -274,7 +276,10 @@ impl QuadGpu {
                     wgpu::BindGroupEntry { binding: 2, resource: self.screen_buf.as_entire_binding() },
                 ],
             });
-            self.textures.insert(up.id, (tex, bind, up.key));
+            self.textures.insert(
+                up.id,
+                (tex, bind, up.key, up.w.max(1) as f32, up.h.max(1) as f32, if up.premul { 1.0 } else { 0.0 }),
+            );
         }
     }
 
@@ -363,12 +368,21 @@ impl QuadGpu {
                         let start = (tex_inst.len() / INST_FLOATS) as u32;
                         cur = Some(Batch { clip, is_tex: true, tex_id: t.id, start, count: 0 });
                     }
+                    // WGSL TexIn: misc=(radius, alpha, tex_w, tex_h)，flags.x=premul。
+                    // 尺寸/premul 从纹理缓存取（本帧可能未上传该 id——跨帧复用）。
+                    // 此前误填 misc.zw=0 使 shader 的 uv/misc.zw 除以 1，像素级 UV
+                    // 被当归一化坐标采样越界 → 所有 canvas 图标不可见。
+                    let (tw, th, premul) = self
+                        .textures
+                        .get(&t.id)
+                        .map(|(_, _, _, w, h, p)| (*w, *h, *p))
+                        .unwrap_or((1.0, 1.0, 1.0));
                     let b = cur.as_mut().unwrap();
                     tex_inst.extend_from_slice(&[
                         t.rect[0], t.rect[1], t.rect[2], t.rect[3],
                         t.uv[0], t.uv[1], t.uv[2], t.uv[3],
-                        t.radius, t.alpha, 0.0, 0.0,
-                        t.id as f32, 0.0, 0.0, 0.0,
+                        t.radius, t.alpha, tw, th,
+                        premul, 0.0, 0.0, 0.0,
                     ]);
                     b.count += 1;
                 }
@@ -401,7 +415,7 @@ impl QuadGpu {
                 set_scissor(pass, b.clip, frame.w, frame.h);
             }
             if b.is_tex {
-                let Some((_, bind, _)) = self.textures.get(&b.tex_id) else { continue };
+                let Some((_, bind, _, _, _, _)) = self.textures.get(&b.tex_id) else { continue };
                 pass.set_pipeline(&self.tex_pipeline);
                 pass.set_bind_group(0, bind, &[]);
                 pass.set_vertex_buffer(0, self.tex_buf.slice(..));
@@ -829,6 +843,37 @@ mod tests {
         queue.submit(Some(enc.finish()));
         // 提交成功即通过（设备校验在 submit/present 阶段兜底）。
         let _ = device.poll(wgpu::PollType::Wait);
+    }
+
+    /// 回归：纹理缓存必须记录像素尺寸与 premul 标记。
+    /// 实例构造（WGSL TexIn misc.zw=tex_w/tex_h、flags.x=premul）从缓存取这两个值；
+    /// 曾误填 misc.zw=0，shader 里 uv/max(0,1)=uv（像素当归一化坐标）→ 采样越界
+    /// clamp 到透明边缘 → 全部 canvas 图标不可见（visual_flow 大面积 FAIL）。
+    /// GPU 离屏像素读回在 llvmpipe 下不可靠，此处固化缓存字段契约；像素级效果
+    /// 由 GUI E2E visual_flow 覆盖。
+    #[test]
+    fn texture_cache_stores_dimensions_and_premul() {
+        let Some((device, queue)) = pollster::block_on(device_or_skip()) else { return };
+        let mut gpu = QuadGpu::new(device.clone(), queue.clone(), wgpu::TextureFormat::Rgba8Unorm);
+        let mut f = GpuFrame::new(4, 4, [0.0; 4]);
+        f.uploads.push(TexUpload {
+            id: 1, key: 7, w: 3, h: 5,
+            data: std::sync::Arc::new(vec![255u8; 3 * 5 * 4]),
+            premul: true,
+        });
+        gpu.sync_textures(&f);
+        let (_, _, key, w, h, premul) = &gpu.textures[&1];
+        assert_eq!(*key, 7);
+        assert_eq!((*w, *h), (3.0, 5.0), "缓存必须记录纹理像素尺寸供 UV 归一化");
+        assert_eq!(*premul, 1.0, "缓存必须记录 premul 供 shader alpha 处置");
+        let mut f2 = GpuFrame::new(4, 4, [0.0; 4]);
+        f2.uploads.push(TexUpload {
+            id: 2, key: 8, w: 2, h: 2,
+            data: std::sync::Arc::new(vec![255u8; 2 * 2 * 4]),
+            premul: false,
+        });
+        gpu.sync_textures(&f2);
+        assert_eq!(gpu.textures[&2].5, 0.0);
     }
 
     #[test]

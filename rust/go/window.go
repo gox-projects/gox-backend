@@ -583,9 +583,28 @@ func (w *Window) pollFrameClock() {
 	}
 }
 
-// DebugWindowSize 供 GUI E2E 快照读取窗口逻辑尺寸（点）。
-// V2 后端窗口不可 resize（winit with_resizable(false)），配置尺寸即实际尺寸。
+// DebugWindowSize 供 GUI E2E 快照读取窗口真实逻辑尺寸（点）。
+// 尺寸真相源在 Rust 渲染端 hub.config（winit Resized 事件实时更新），Go 侧
+// w.cfg 只是创建时的初始配置——窗口被 resize 后是陈旧的（E2E resize 断言
+// 读它永远拿到初始值）。debug_info JSON 的 win_w/win_h 来自 provider 实时
+// 查询，这里读它；窗口尚未泵帧时回退到创建配置。
 func (w *Window) DebugWindowSize() (int, int) {
+	w.mu.Lock()
+	handle := w.handle
+	opened := handle != nil && w.pumped
+	w.mu.Unlock()
+	if opened {
+		raw := cDebugInfo(handle)
+		if raw != "" {
+			var info struct {
+				WinW float32 `json:"win_w"`
+				WinH float32 `json:"win_h"`
+			}
+			if json.Unmarshal([]byte(raw), &info) == nil && info.WinW > 0 && info.WinH > 0 {
+				return int(info.WinW), int(info.WinH)
+			}
+		}
+	}
 	cfg := w.Config()
 	return cfg.Width, cfg.Height
 }

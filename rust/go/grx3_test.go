@@ -1,11 +1,32 @@
 package rustbackend
 
 import (
+	"encoding/binary"
 	"strings"
 	"testing"
 
 	gxscene "github.com/robertpanvip/gox-core/runtime/scene"
 )
+
+// TestGRX3DeltaMagicDistinct 固化「全量帧与增量帧 magic 必须不同」的协议契约。
+// 二者若共用 0x33585247，Rust apply_frame 的 FrameView::parse（先试）会把
+// 增量帧误判成全量快照，字段错位后 pool_str 读越界 offset → panic 杀死
+// 事件泵线程（GUI E2E 场景 10 后所有交互失效的根因）。
+func TestGRX3DeltaMagicDistinct(t *testing.T) {
+	if deltaMagicV3 == binMagicV3 {
+		t.Fatalf("GRX3 增量帧 magic 与全量帧相同 (0x%08X)：必须先试全量解析会误判增量帧", binMagicV3)
+	}
+	root := buildTree(4)
+	frame := mustFrameV3(t, root)
+	changes := []gxscene.Change{{Kind: gxscene.ChangeSetText, NodeID: "1", Value: "x"}}
+	delta := mustDeltaV3(t, changes, root)
+	frameMagic := binary.LittleEndian.Uint32(frame[0:4])
+	deltaMagic := binary.LittleEndian.Uint32(delta[0:4])
+	if frameMagic != binMagicV3 || deltaMagic != deltaMagicV3 || frameMagic == deltaMagic {
+		t.Fatalf("帧 magic 错误：全量=0x%08X 增量=0x%08X（应分别为 0x%08X / 0x%08X 且不等）",
+			frameMagic, deltaMagic, binMagicV3, deltaMagicV3)
+	}
+}
 
 // ---------- GRX3：NodeID uint64 直传端到端验证 ----------
 //

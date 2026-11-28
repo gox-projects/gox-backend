@@ -17,11 +17,22 @@ const NODE_SZ_V3: usize = 40;
 const PROP_SZ: usize = 12;
 const EVENT_SZ: usize = 12;
 
+// 零拷贝读取必须绝对不 panic：解析在事件泵线程执行，任何越界 panic 都会
+// 杀死整个 UI 事件循环（表现为点击一次后所有输入永久失效）。坏帧/截断帧
+// 一律返回 0，交由上层校验判为非法，绝不 unwind。
 fn u32at(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    let s = match b.get(o..o + 4) {
+        Some(s) => s,
+        None => return 0,
+    };
+    u32::from_le_bytes([s[0], s[1], s[2], s[3]])
 }
 fn u16at(b: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes([b[o], b[o + 1]])
+    let s = match b.get(o..o + 2) {
+        Some(s) => s,
+        None => return 0,
+    };
+    u16::from_le_bytes([s[0], s[1]])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -132,24 +143,29 @@ impl<'a> FrameView<'a> {
     fn pool_str(&self, off: u32) -> &'a str {
         let o = self.pool_off + off as usize;
         let len = u16at(self.buf, o) as usize;
-        let s = &self.buf[o + 2..o + 2 + len];
+        let s = match self.buf.get(o + 2..o + 2 + len) {
+            Some(s) => s,
+            None => return "",
+        };
         std::str::from_utf8(s).unwrap_or("")
     }
 
     #[inline]
     pub fn node(&self, i: usize) -> NodeView<'a> {
         let o = self.nodes_off + i * self.node_sz;
-        let typ = match self.buf[o] {
-            1 => NodeType::Div,
-            2 => NodeType::Text,
+        let typ = match self.buf.get(o) {
+            Some(1) => NodeType::Div,
+            Some(2) => NodeType::Text,
             _ => NodeType::Fragment,
         };
-        let has_events = self.buf[o + 1] & 0x1 != 0;
+        let has_events = self.buf.get(o + 1).map(|b| b & 0x1 != 0).unwrap_or(false);
         let id = self.pool_str(u32at(self.buf, o + 8));
         // GRX3：node_id 直传（节点结构尾部 u64）；GRX1：从 id 字符串 parse 补齐。
         let node_id = if self.node_sz == NODE_SZ_V3 {
-            let b = self.buf[o + 32..o + 40].try_into().unwrap_or([0; 8]);
-            u64::from_le_bytes(b)
+            match self.buf.get(o + 32..o + 40).and_then(|s| s.try_into().ok()) {
+                Some(b) => u64::from_le_bytes(b),
+                None => 0,
+            }
         } else {
             id.trim().parse::<u64>().unwrap_or(0)
         };

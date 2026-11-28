@@ -408,12 +408,21 @@ fn present_loop(
                     }
                 }
             }
-            PresentMsg::Frame(frame) => {
+            PresentMsg::Frame(mut frame) => {
                 hub.busy
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 // acquire：Fifo 背压阻塞点。不持任何渲染器锁——UI 线程在等待
                 // 期间自由泵事件、prepare 下一帧。
                 let cfg = hub.config.lock().unwrap().clone();
+                // resize 竞态：队列里可能残留按旧尺寸构建的帧（旧 1400×860），
+                // surface 已 reconfigure 到新尺寸（1200×700）。scissor 按 frame
+                // 尺寸裁到 1400×860 会超出 render target，wgpu 校验 panic →
+                // present 线程 panic → state 锁 poison → 全部事件处理连锁失败。
+                // 帧尺寸对齐到 surface 真相源，矩形被 clamp 进 target，绝不越界。
+                if frame.w != cfg.width || frame.h != cfg.height {
+                    frame.w = cfg.width;
+                    frame.h = cfg.height;
+                }
                 let tex = {
                     let guard = hub.surface.lock().unwrap();
                     match guard.as_ref() {

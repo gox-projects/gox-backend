@@ -173,7 +173,7 @@ func serializeDelta(changes []gxscene.Change, root *gxscene.Node, width, height 
 
 // ---------- GRX3 delta：NodeID uint64 直传 ----------
 //
-// magic 0x33585247，动作 48 字节：
+// magic 0x33585248（GRX3D，独立于全量帧 0x33585247），动作 48 字节：
 //
 //	o+0  kind u8 | o+8 node_id u64 | o+16 child_id u64 | o+24 before_id u64
 //	o+32 key_off u32 | o+36 blob_off u32 | o+40 val_off u32 | o+44 blob_len u32
@@ -183,7 +183,10 @@ func serializeDelta(changes []gxscene.Change, root *gxscene.Node, width, height 
 // id → ok=false，调用方回退全量快照（与 GRX2 的失败语义一致）。
 
 const (
-	deltaMagicV3 = 0x33585247 // "GRX3"
+	// GRX3 增量帧必须用独立 magic：GRX3 全量帧占用 0x33585247。若共用，
+	// Rust apply_frame 的 FrameView::parse（先试）会把本帧误判成全量帧，
+	// 字段错位后 pool_str 读到越界 offset → panic 杀死事件泵线程。
+	deltaMagicV3 = 0x33585248 // "GRX3D"
 	actionSizeV3 = 48
 )
 
