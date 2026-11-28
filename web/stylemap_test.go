@@ -229,3 +229,101 @@ func TestAnimationIsStyleKey(t *testing.T) {
 		}
 	}
 }
+
+// ---------- 自定义关键帧 ----------
+
+func TestKeyframesCSSNameStable(t *testing.T) {
+	a := keyframesCSSName(`[{"offset":"0","props":{"opacity":"0"}}]`)
+	b := keyframesCSSName(`[{"offset":"0","props":{"opacity":"0"}}]`)
+	c := keyframesCSSName(`[{"offset":"0","props":{"opacity":"1"}}]`)
+	if a != b {
+		t.Errorf("相同内容 hash 应稳定: %q vs %q", a, b)
+	}
+	if a == c {
+		t.Errorf("不同内容 hash 应不同")
+	}
+	if !strings.HasPrefix(a, "gx-kf-") {
+		t.Errorf("帧名应有 gx-kf- 前缀: %q", a)
+	}
+}
+
+func TestBuildKeyframesCSS(t *testing.T) {
+	jsonText := `[{"offset":"0","props":{"opacity":"0","bg":"#000"}},{"offset":"1","props":{"opacity":"1","bg":"#fff"}}]`
+	got := buildKeyframesCSS(jsonText, "gx-kf-test")
+	want := "@keyframes gx-kf-test {0%{opacity:0;background-color:#000;}100%{opacity:1;background-color:#fff;}}"
+	// map 遍历顺序不定，改为逐片段断言。
+	if !strings.HasPrefix(got, "@keyframes gx-kf-test {") {
+		t.Errorf("缺少 keyframes 头: %s", got)
+	}
+	for _, frag := range []string{"0%{", "100%{", "opacity:0;", "opacity:1;", "background-color:#000;", "background-color:#fff;"} {
+		if !strings.Contains(got, frag) {
+			t.Errorf("缺少片段 %q: %s", frag, got)
+		}
+	}
+	_ = want
+}
+
+func TestBuildKeyframesCSSOffsetForms(t *testing.T) {
+	// offset 支持小数与百分号。
+	got := buildKeyframesCSS(`[{"offset":0.5,"props":{"opacity":"0.5"}},{"offset":"75%","props":{"opacity":"1"}}]`, "gx-kf-x")
+	for _, frag := range []string{"50%{", "75%{", "opacity:0.5;", "opacity:1;"} {
+		if !strings.Contains(got, frag) {
+			t.Errorf("缺少 %q: %s", frag, got)
+		}
+	}
+}
+
+func TestBuildKeyframesCSSInvalid(t *testing.T) {
+	if buildKeyframesCSS("", "x") != "" {
+		t.Error("空 JSON 应返回空串")
+	}
+	if buildKeyframesCSS("not json", "x") != "" {
+		t.Error("非法 JSON 应返回空串")
+	}
+	if buildKeyframesCSS(`[]`, "x") != "" {
+		t.Error("空数组应返回空串")
+	}
+	// 无可用属性时返回空（keyframePropName 白名单过滤）。
+	if buildKeyframesCSS(`[{"offset":"0","props":{"bogus":"x"}}]`, "x") != "" {
+		t.Error("无可用属性应返回空串")
+	}
+}
+
+func TestAnimationCSSWithKeyframes(t *testing.T) {
+	// 自定义动画简写串无 name（"1000ms -1"），用 hash 帧名产出 CSS。
+	got := animationCSSWithKeyframes("1000ms -1", "gx-kf-test")
+	if got != "gx-kf-test 1s linear infinite" {
+		t.Errorf("自定义动画 CSS = %q", got)
+	}
+	// 有限次数。
+	got = animationCSSWithKeyframes("500ms 3", "gx-kf-test")
+	if got != "gx-kf-test 0.5s linear 3" {
+		t.Errorf("有限次数 CSS = %q", got)
+	}
+	// 秒单位。
+	got = animationCSSWithKeyframes("1.06s infinite", "gx-kf-test")
+	if got != "gx-kf-test 1.06s linear infinite" {
+		t.Errorf("秒单位 CSS = %q", got)
+	}
+	// kfName 空时走原 blink 路径（回归）。
+	if got := animationCSSWithKeyframes("blink 1.06s infinite", ""); got != "gx-blink 1.06s steps(1) infinite" {
+		t.Errorf("内置 blink 路径被破坏: %q", got)
+	}
+}
+
+func TestAnimationDurationFallback(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int64
+	}{
+		{"1000ms -1", 1000},
+		{"1.06s infinite", 1060},
+		{"500ms 3", 500},
+		{"infinite", 0},
+	}
+	for _, c := range cases {
+		if got := animationDurationFallback(c.in); got != c.want {
+			t.Errorf("animationDurationFallback(%q)=%d, want %d", c.in, got, c.want)
+		}
+	}
+}

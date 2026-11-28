@@ -28,6 +28,8 @@ type jsDriver struct {
 	selectionInjected bool
 	// animationInjected 标记全局 @keyframes 规则是否已注入（懒加载一次）。
 	animationInjected bool
+	// injectedKeyframes 记录已注入的自定义 @keyframes 帧名（幂等，避免重复 append）。
+	injectedKeyframes map[string]bool
 
 	// RAF 投递：同一帧内多次 Post 只登记一次 requestAnimationFrame。
 	// 浏览器在下一帧回调里统一 drain，避免事件处理期间同步重入 DOM 提交。
@@ -43,13 +45,18 @@ type jsElem struct {
 	kind      string
 	listeners map[string]js.Func
 	canvasCtx js.Value
+	// animation 与 animation-keyframes 分别到达、顺序不定；缓存两者，任一变化时
+	// 统一重算 CSS animation，保证自定义关键帧与简写串正确组合。
+	animValue  string
+	animFrames string
 }
 
 func newJSDriver(root js.Value) *jsDriver {
 	d := &jsDriver{
-		elements: map[ElemID]*jsElem{},
-		doc:      js.Global().Get("document"),
-		win:      js.Global(),
+		elements:          map[ElemID]*jsElem{},
+		injectedKeyframes: map[string]bool{},
+		doc:               js.Global().Get("document"),
+		win:               js.Global(),
 	}
 	if !root.Truthy() {
 		root = d.doc.Get("body")
@@ -229,6 +236,49 @@ func (d *jsDriver) injectAnimationCSSLocked() {
 	}
 }
 
+// injectKeyframesLocked 按帧名幂等注入一条自定义 @keyframes。
+// 帧名由内容 hash 生成（keyframesCSSName），同一内容只注入一次。
+func (d *jsDriver) injectKeyframesLocked(name, cssText string) {
+	if name == "" || cssText == "" || d.injectedKeyframes[name] {
+		return
+	}
+	d.injectedKeyframes[name] = true
+	style := d.doc.Call("createElement", "style")
+	style.Call("setAttribute", "id", "gx-kf-"+name)
+	style.Set("textContent", cssText)
+	head := d.doc.Get("head")
+	if head.Truthy() {
+		head.Call("appendChild", style)
+	} else if d.doc.Get("body").Truthy() {
+		d.doc.Get("body").Call("appendChild", style)
+	}
+}
+
+// applyAnimationLocked 统一重算元素的 CSS animation（在持有 mu 时调用）。
+// 自定义关键帧存在时注入 @keyframes 并用 hash 帧名；否则用内置 blink 路径。
+func (d *jsDriver) applyAnimationLocked(el *jsElem) {
+	var css string
+	var kfName, kfCSS string
+	if strings.TrimSpace(el.animFrames) != "" {
+		kfName = keyframesCSSName(el.animFrames)
+		kfCSS = buildKeyframesCSS(el.animFrames, kfName)
+	}
+	if kfName != "" && kfCSS != "" {
+		d.injectKeyframesLocked(kfName, kfCSS)
+		css = animationCSSWithKeyframes(el.animValue, kfName)
+	} else {
+		css = animationCSS(el.animValue)
+		if css != "" {
+			d.injectAnimationCSSLocked()
+		}
+	}
+	if css == "" {
+		el.v.Get("style").Call("removeProperty", "animation")
+	} else {
+		el.v.Get("style").Call("setProperty", "animation", css)
+	}
+}
+
 func (d *jsDriver) SetAttr(e ElemID, key, value string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -275,16 +325,16 @@ func (d *jsDriver) SetAttr(e ElemID, key, value string) {
 		}
 		return
 	}
-	// animation 是三端统一的声明式动画 prop：翻译成原生 CSS animation，并在
-	// 首次使用时注入共享 @keyframes。空/非法值移除属性，回到静态样式。
-	if strings.EqualFold(key, "animation") {
-		css := animationCSS(value)
-		if css == "" {
-			el.v.Get("style").Call("removeProperty", "animation")
+	// animation / animation-keyframes 是三端统一的声明式动画 prop：二者到达顺序
+	// 不定，缓存后统一重算。animation-keyframes 非空时按内容 hash 注入自定义
+	// @keyframes，用帧名组合 animation；否则走内置 blink 路径。
+	if strings.EqualFold(key, "animation") || strings.EqualFold(key, "animation-keyframes") {
+		if strings.EqualFold(key, "animation") {
+			el.animValue = value
 		} else {
-			d.injectAnimationCSSLocked()
-			el.v.Get("style").Call("setProperty", "animation", css)
+			el.animFrames = value
 		}
+		d.applyAnimationLocked(el)
 		return
 	}
 	// scroll-top / scroll-left 是元素滚动位置（el.scrollTop），不是 CSS 属性。

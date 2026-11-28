@@ -110,11 +110,20 @@ impl Default for Style {
     }
 }
 
-/// 声明式动画解析结果，语义与 Go 端 gxscene.AnimationSpec 严格对齐。
-#[derive(Clone, Copy, Debug)]
+/// 声明式动画解析结果，语义与 Go 端 gxscene.AnimationSpec / AnimationStyle 对齐。
+#[derive(Clone, Debug)]
 pub struct AnimationSpec {
     pub duration_ms: i64,
     pub iterations: i64, // -1 = infinite
+    /// 内嵌关键帧（自定义动画）；为空表示内置 blink 方波。
+    pub keyframes: Vec<Keyframe>,
+}
+
+/// 单个关键帧：offset ∈ [0,1]，props 是该帧的样式覆盖。
+#[derive(Clone, Debug)]
+pub struct Keyframe {
+    pub offset: f32,
+    pub props: HashMap<String, String>,
 }
 
 impl AnimationSpec {
@@ -133,6 +142,57 @@ impl AnimationSpec {
         } else {
             0.0
         })
+    }
+
+    /// 采样内嵌关键帧动画：按绝对时钟定位当前帧区间，逐属性插值。
+    /// 返回 (属性名, 协议字符串) 列表供写回临时树；有限次数结束后返回空。
+    pub fn sample_keyframes(&self, now_ms: i64) -> Vec<(String, String)> {
+        if self.keyframes.is_empty() || self.duration_ms <= 0 {
+            return Vec::new();
+        }
+        if self.iterations > 0 && now_ms >= self.duration_ms * self.iterations {
+            return Vec::new();
+        }
+        let phase_ms = (now_ms % self.duration_ms).max(0) as f32;
+        let t = phase_ms / self.duration_ms as f32;
+        // 定位 [i, i+1] 区间：第一个 offset >= t 的帧为右端。
+        let mut hi = 0;
+        while hi < self.keyframes.len() && self.keyframes[hi].offset < t {
+            hi += 1;
+        }
+        if hi == 0 {
+            // t 落在首帧之前或等于首帧 → 输出首帧 props（静态）。
+            return self.keyframes[0]
+                .props
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        }
+        if hi >= self.keyframes.len() {
+            // 超过最后一帧 → 输出末帧 props。
+            let last = &self.keyframes[self.keyframes.len() - 1];
+            return last.props.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        }
+        let lo = hi - 1;
+        let a = &self.keyframes[lo];
+        let b = &self.keyframes[hi];
+        let span = b.offset - a.offset;
+        let local = if span > 0.0 { (t - a.offset) / span } else { 0.0 };
+        // 对左帧出现的每个属性插值；右帧缺失的属性视为保持左帧值。
+        let mut out = Vec::new();
+        for (prop, raw) in &a.props {
+            let Some(from) = AnimValue::parse_key(prop, raw) else {
+                out.push((prop.clone(), raw.clone()));
+                continue;
+            };
+            let to = b
+                .props
+                .get(prop)
+                .and_then(|r| AnimValue::parse_key(prop, r))
+                .unwrap_or_else(|| from.clone());
+            out.push((prop.clone(), from.lerp(&to, local).to_prop()));
+        }
+        out
     }
 }
 
@@ -157,6 +217,7 @@ pub fn parse_animation(s: &str) -> Option<AnimationSpec> {
     let mut spec = AnimationSpec {
         duration_ms: 0,
         iterations: -1,
+        keyframes: Vec::new(),
     };
     for t in &toks[1..] {
         if *t == "infinite" {
@@ -182,9 +243,75 @@ pub fn parse_animation(s: &str) -> Option<AnimationSpec> {
     }
 }
 
-/// 从节点 props 读取 animation 并解析。
+/// 解析 animation-keyframes JSON 串：
+///   [{"offset":"0","props":{"opacity":"0"}},...]
+/// 非法/空返回空表（静默回退，不 panic）。offset 是 0..1 或 "0%" 形式。
+fn parse_keyframes(json: &str) -> Vec<Keyframe> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let offset = obj
+            .get("offset")
+            .and_then(|x| match x {
+                serde_json::Value::String(s) => parse_offset(s),
+                serde_json::Value::Number(n) => n.as_f64().map(|f| f as f32),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        let mut props = HashMap::new();
+        if let Some(p) = obj.get("props").and_then(|x| x.as_object()) {
+            for (k, val) in p {
+                let s = match val {
+                    serde_json::Value::String(x) => x.clone(),
+                    serde_json::Value::Number(x) => x.to_string(),
+                    serde_json::Value::Bool(x) => x.to_string(),
+                    _ => continue,
+                };
+                props.insert(k.clone(), s);
+            }
+        }
+        out.push(Keyframe { offset, props });
+    }
+    out
+}
+
+/// offset 字符串："0.5" → 0.5；"50%" → 0.5。
+fn parse_offset(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if let Some(pct) = s.strip_suffix('%') {
+        return pct.trim().parse::<f32>().ok().map(|v| v / 100.0);
+    }
+    s.parse::<f32>().ok()
+}
+
+/// 从节点 props 读取 animation 并解析（含内嵌关键帧）。
+/// animation-keyframes 可独立于 animation 简写串存在：若简写串缺失但关键帧存在，
+/// 用默认时长（1s）构造 spec，保证自定义帧动画在无简写时也能跑。
 pub fn animation_from_props(n: &SceneNode) -> Option<AnimationSpec> {
-    n.props.get("animation").and_then(|s| parse_animation(s))
+    let mut spec = n
+        .props
+        .get("animation")
+        .and_then(|s| parse_animation(s))
+        .unwrap_or(AnimationSpec {
+            duration_ms: 1000,
+            iterations: -1,
+            keyframes: Vec::new(),
+        });
+    if let Some(json) = n.props.get("animation-keyframes") {
+        spec.keyframes = parse_keyframes(json);
+    }
+    if spec.duration_ms <= 0 || (spec.keyframes.is_empty() && !n.props.contains_key("animation")) {
+        return None;
+    }
+    Some(spec)
 }
 
 /// 扫描整棵树是否存在活跃的声明式动画。用于渲染前置判断：周期动画无外部事件
@@ -796,9 +923,8 @@ enum AnimValue {
 }
 
 impl AnimValue {
-    /// 按属性名与 props 解析目标值。返回 None 表示该属性不可动画/值非法。
-    fn parse(property: &str, props: &HashMap<String, String>) -> Option<Self> {
-        let raw = props.get(property)?.as_str();
+    /// 按属性名与原始字符串解析值。返回 None 表示该属性不可动画/值非法。
+    fn parse_key(property: &str, raw: &str) -> Option<Self> {
         if is_color_prop(property) {
             return parse_color_rgba(raw).map(Self::Color);
         }
@@ -806,6 +932,12 @@ impl AnimValue {
             return Some(Self::Transform(parse_transform(raw)));
         }
         parse_px(raw).map(Self::Number)
+    }
+
+    /// 按属性名与 props 解析目标值。返回 None 表示该属性不可动画/值非法。
+    fn parse(property: &str, props: &HashMap<String, String>) -> Option<Self> {
+        let raw = props.get(property)?.as_str();
+        Self::parse_key(property, raw)
     }
 
     /// 线性插值（t 已经过缓动）。
@@ -1002,7 +1134,12 @@ impl Animator {
         // needs_continuous_redraw 据此维持重绘。
         if let Some(spec) = animation_from_props(src) {
             self.has_animation = true;
-            if let Some(op) = spec.sample_blink(self.now_ms as i64) {
+            if !spec.keyframes.is_empty() {
+                // 自定义关键帧：逐属性采样写回临时树（优先级仍高于 transition）。
+                for (prop, val) in spec.sample_keyframes(self.now_ms as i64) {
+                    dst.props.insert(prop, val);
+                }
+            } else if let Some(op) = spec.sample_blink(self.now_ms as i64) {
                 dst.props.insert("opacity".into(), format!("{:.3}", op));
             }
         }
@@ -1500,6 +1637,146 @@ mod tests {
         a.set_now(1301); // 1101 + 200
         let out = a.apply(&n);
         assert_eq!(out.props["bg"], "#ff0000ff", "200ms 后到红色");
+    }
+
+    // ---------- 内嵌关键帧动画 ----------
+
+    fn kf_node(json: &str, dur: &str) -> SceneNode {
+        node(&[("animation", dur), ("animation-keyframes", json)])
+    }
+
+    #[test]
+    fn keyframes_parse_offset_forms() {
+        assert_eq!(parse_offset("0.5"), Some(0.5));
+        assert_eq!(parse_offset("50%"), Some(0.5));
+        assert_eq!(parse_offset("100%"), Some(1.0));
+        assert_eq!(parse_offset("abc"), None);
+    }
+
+    #[test]
+    fn keyframes_parse_json() {
+        let json = r##"[{"offset":"0","props":{"opacity":"0","bg":"#000000"}},{"offset":"1","props":{"opacity":"1","bg":"#ffffff"}}]"##;
+        let kfs = parse_keyframes(json);
+        assert_eq!(kfs.len(), 2);
+        assert_eq!(kfs[0].offset, 0.0);
+        assert_eq!(kfs[0].props["opacity"], "0");
+        assert_eq!(kfs[1].offset, 1.0);
+        assert_eq!(kfs[1].props["bg"], "#ffffff");
+    }
+
+    #[test]
+    fn keyframes_parse_invalid_falls_back() {
+        assert!(parse_keyframes("not json").is_empty());
+        assert!(parse_keyframes("{}").is_empty()); // 非数组
+        // 缺 offset 的帧用 0.0 兜底，不 panic。
+        let kfs = parse_keyframes(r#"[{"props":{"opacity":"1"}}]"#);
+        assert_eq!(kfs.len(), 1);
+        assert_eq!(kfs[0].offset, 0.0);
+    }
+
+    #[test]
+    fn keyframes_sample_opacity_midpoint() {
+        // 0ms→opacity 0，1000ms→opacity 1；500ms 应≈0.5。
+        let json = r##"[{"offset":"0","props":{"opacity":"0"}},{"offset":"1","props":{"opacity":"1"}}]"##;
+        let spec = parse_animation("blink 1000ms infinite").unwrap();
+        let spec = AnimationSpec {
+            keyframes: parse_keyframes(json),
+            ..spec
+        };
+        let out = spec.sample_keyframes(500);
+        let op: f32 = out.iter().find(|(k, _)| k == "opacity").unwrap().1.parse().unwrap();
+        assert!((op - 0.5).abs() < 0.01, "中点 opacity≈0.5，got {}", op);
+    }
+
+    #[test]
+    fn keyframes_sample_color_midpoint() {
+        // #000000 → #ffffff；中点为中灰。
+        let json = r##"[{"offset":"0","props":{"bg":"#000000"}},{"offset":"1","props":{"bg":"#ffffff"}}]"##;
+        let spec = AnimationSpec {
+            keyframes: parse_keyframes(json),
+            ..parse_animation("blink 1000ms").unwrap()
+        };
+        let out = spec.sample_keyframes(500);
+        let bg = &out.iter().find(|(k, _)| k == "bg").unwrap().1;
+        let (r, _, _, _) = parse_color_rgba(bg).unwrap();
+        assert!((r as i32 - 128).abs() <= 1, "中点应≈128，got {}", r);
+    }
+
+    #[test]
+    fn keyframes_sample_transform_midpoint() {
+        // translateX(0) → translateX(100px)；中点为 50px。
+        let json = r##"[{"offset":"0","props":{"transform":"translate(0px, 0px) scale(1)"}},{"offset":"1","props":{"transform":"translate(100px, 0px) scale(1)"}}]"##;
+        let spec = AnimationSpec {
+            keyframes: parse_keyframes(json),
+            ..parse_animation("blink 1000ms").unwrap()
+        };
+        let out = spec.sample_keyframes(500);
+        let tr = &out.iter().find(|(k, _)| k == "transform").unwrap().1;
+        let t = parse_transform(tr);
+        assert!((t.translate_x - 50.0).abs() < 0.01, "中点 translateX≈50，got {}", t.translate_x);
+    }
+
+    #[test]
+    fn keyframes_sample_three_frames_piecewise() {
+        // 0→0.5→1，offset 0/0.5/1；t=0.25 落在首段中点 → opacity 0.25。
+        let json = r##"[{"offset":"0","props":{"opacity":"0"}},{"offset":"0.5","props":{"opacity":"0.5"}},{"offset":"1","props":{"opacity":"1"}}]"##;
+        let spec = AnimationSpec {
+            keyframes: parse_keyframes(json),
+            ..parse_animation("blink 1000ms").unwrap()
+        };
+        let out = spec.sample_keyframes(250);
+        let op: f32 = out.iter().find(|(k, _)| k == "opacity").unwrap().1.parse().unwrap();
+        assert!((op - 0.25).abs() < 0.01, "t=0.25 应≈0.25，got {}", op);
+    }
+
+    #[test]
+    fn keyframes_sample_before_after_bounds() {
+        // t 落在首帧前/末帧后，输出对应端点帧（不 panic）。
+        let json = r##"[{"offset":"0.2","props":{"opacity":"0.2"}},{"offset":"0.8","props":{"opacity":"0.8"}}]"##;
+        let spec = AnimationSpec {
+            keyframes: parse_keyframes(json),
+            ..parse_animation("blink 1000ms").unwrap()
+        };
+        let out0 = spec.sample_keyframes(0); // t=0 < 0.2 → 首帧
+        let op0: f32 = out0.iter().find(|(k, _)| k == "opacity").unwrap().1.parse().unwrap();
+        assert!((op0 - 0.2).abs() < 0.01);
+        let out1 = spec.sample_keyframes(900); // t=0.9 > 0.8 → 末帧
+        let op1: f32 = out1.iter().find(|(k, _)| k == "opacity").unwrap().1.parse().unwrap();
+        assert!((op1 - 0.8).abs() < 0.01);
+    }
+
+    #[test]
+    fn keyframes_finite_iterations_stop() {
+        let json = r##"[{"offset":"0","props":{"opacity":"0"}},{"offset":"1","props":{"opacity":"1"}}]"##;
+        let spec = AnimationSpec {
+            keyframes: parse_keyframes(json),
+            ..parse_animation("blink 1000ms 2").unwrap()
+        };
+        assert!(!spec.sample_keyframes(1999).is_empty(), "未结束应活跃");
+        assert!(spec.sample_keyframes(2000).is_empty(), "结束后不覆盖");
+    }
+
+    #[test]
+    fn keyframes_animator_writes_to_tree() {
+        // 端到端：Animator.apply 把关键帧采样值写进临时树，常驻树不污染。
+        let json = r##"[{"offset":"0","props":{"opacity":"0"}},{"offset":"1","props":{"opacity":"1"}}]"##;
+        let n = kf_node(json, "keyframes 1000ms infinite");
+        let mut a = Animator::new();
+        a.set_now(500);
+        let out = a.apply(&n);
+        let op: f32 = out.props["opacity"].parse().unwrap();
+        assert!((op - 0.5).abs() < 0.01, "临时树 opacity≈0.5，got {}", op);
+        assert!(!n.props.contains_key("opacity"), "常驻树不被污染");
+        assert!(a.has_active_animation(), "关键帧动画应维持重绘");
+    }
+
+    #[test]
+    fn keyframes_animation_from_props_without_shorthand() {
+        // 只有 animation-keyframes、无 animation 简写串时，也能构造 spec（默认 1s）。
+        let n = node(&[("animation-keyframes", r##"[{"offset":"0","props":{"opacity":"0"}}]"##)]);
+        let spec = animation_from_props(&n).expect("应识别关键帧动画");
+        assert_eq!(spec.duration_ms, 1000);
+        assert_eq!(spec.keyframes.len(), 1);
     }
 }
 

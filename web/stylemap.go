@@ -3,6 +3,7 @@ package gxweb
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"strconv"
 	"strings"
 
@@ -22,7 +23,7 @@ func isStyleKey(key string) bool {
 		"flex-grow", "flex-shrink", "min-width", "max-width", "min-height", "max-height",
 		"margin", "margin-top", "margin-bottom", "margin-left", "margin-right",
 		"text-align", "line-height", "letter-spacing", "z-index", "cursor",
-		"white-space", "animation", "pointer-events":
+		"white-space", "animation", "animation-keyframes", "pointer-events":
 		return true
 	}
 	if isPseudoElementKey(key) {
@@ -84,7 +85,36 @@ const animationGlobalCSS = "@keyframes gx-blink { 0%,49% { opacity: 1; } 50%,100
 // 原生 CSS animation 值（如 "gx-blink 1.06s steps(1) infinite"）。
 // 非法/空值返回空串，让调用方移除 animation 属性。
 func animationCSS(value string) string {
+	return animationCSSWithKeyframes(value, "")
+}
+
+// animationCSSWithKeyframes 在 animationCSS 基础上支持自定义关键帧帧名：
+// kfName 非空时用 "gx-<hash>" 作为 animation-name（自定义关键帧），timing 用 linear；
+// 否则走内置 blink 路径。自定义动画的简写串可能没有 name（如 "1000ms -1"），
+// 此时 ParseAnimation 不 Active，但只要有 kfName 就应产出 CSS。
+func animationCSSWithKeyframes(value, kfName string) string {
 	spec := gxscene.ParseAnimation(value)
+	durMS := spec.DurationMS
+	iterations := spec.Iterations
+	if kfName != "" {
+		// 自定义动画：从简写串兜底解析时长/迭代（name 位可能是时长）。
+		if durMS <= 0 {
+			durMS = animationDurationFallback(value)
+		}
+		if iterations == 0 {
+			iterations = animationIterationsFallback(value)
+		}
+		if durMS <= 0 {
+			return ""
+		}
+		dur := float64(durMS) / 1000
+		durStr := strconv.FormatFloat(dur, 'g', -1, 64) + "s"
+		iter := strconv.Itoa(iterations)
+		if iterations < 0 {
+			iter = "infinite"
+		}
+		return kfName + " " + durStr + " linear " + iter
+	}
 	if !spec.Active() {
 		return ""
 	}
@@ -100,6 +130,170 @@ func animationCSS(value string) string {
 		timing = "steps(1)"
 	}
 	return "gx-" + spec.Name + " " + durStr + " " + timing + " " + iter
+}
+
+// animationDurationFallback 从简写串里提取时长（毫秒）：
+// 自定义动画串形如 "1000ms -1" / "1s infinite"，name 位缺失。
+func animationDurationFallback(value string) int64 {
+	for _, tok := range strings.Fields(strings.ToLower(strings.TrimSpace(value))) {
+		if tok == "infinite" {
+			continue
+		}
+		// 迭代次数（纯数字）跳过。
+		if _, err := strconv.Atoi(tok); err == nil {
+			continue
+		}
+		if v, ok := parseWebDurationMS(tok); ok {
+			return v
+		}
+	}
+	return 0
+}
+
+// animationIterationsFallback 从简写串兜底解析迭代次数：-1/infinite → -1；
+// 正整数 → 该数；缺省 -1。时长 token（带 s/ms）跳过。
+func animationIterationsFallback(value string) int {
+	for _, tok := range strings.Fields(strings.ToLower(strings.TrimSpace(value))) {
+		if tok == "infinite" || tok == "-1" {
+			return -1
+		}
+		if strings.HasSuffix(tok, "ms") || strings.HasSuffix(tok, "s") {
+			continue
+		}
+		if n, err := strconv.Atoi(tok); err == nil && n > 0 {
+			return n
+		}
+	}
+	return -1
+}
+
+func parseWebDurationMS(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if strings.HasSuffix(s, "ms") {
+		v, err := strconv.ParseFloat(strings.TrimSuffix(s, "ms"), 64)
+		return int64(v), err == nil
+	}
+	if strings.HasSuffix(s, "s") {
+		v, err := strconv.ParseFloat(strings.TrimSuffix(s, "s"), 64)
+		return int64(v * 1000), err == nil
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	return int64(v * 1000), err == nil
+}
+
+// keyframesCSSName 基于关键帧 JSON 生成稳定的帧名（内容 hash，避免同名冲突）。
+func keyframesCSSName(jsonText string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(jsonText))
+	return fmt.Sprintf("gx-kf-%x", h.Sum64())
+}
+
+// buildKeyframesCSS 把 animation-keyframes JSON 翻译成原生 @keyframes 文本：
+//
+//	[{"offset":"0","props":{"opacity":"0","bg":"#000"}},...]
+//	  → @keyframes gx-kf-xxx { 0% { opacity:0; background-color:#000; } ... }
+//
+// keyframesJSON 为空/非法返回空串。属性 kebab key 映射成 CSS 属性名（bg→background-color）。
+func buildKeyframesCSS(jsonText, name string) string {
+	if strings.TrimSpace(jsonText) == "" {
+		return ""
+	}
+	var frames []struct {
+		Offset json.RawMessage            `json:"offset"`
+		Props  map[string]json.RawMessage `json:"props"`
+	}
+	if err := json.Unmarshal([]byte(jsonText), &frames); err != nil || len(frames) == 0 {
+		return ""
+	}
+	var rules []string
+	for _, f := range frames {
+		pct := keyframeOffsetPercent(f.Offset)
+		if pct < 0 {
+			continue
+		}
+		var decls []string
+		for k, raw := range f.Props {
+			cssKey := keyframePropName(k)
+			if cssKey == "" {
+				continue
+			}
+			var v any
+			if err := json.Unmarshal(raw, &v); err != nil {
+				continue
+			}
+			var val string
+			switch x := v.(type) {
+			case string:
+				val = x
+			case float64:
+				val = strconv.FormatFloat(x, 'g', -1, 64)
+			default:
+				continue
+			}
+			decls = append(decls, cssKey+":"+val+";")
+		}
+		if len(decls) == 0 {
+			continue // 无可用属性的帧不生成空规则
+		}
+		rules = append(rules, pctStr(pct)+"{"+strings.Join(decls, "")+"}")
+	}
+	if len(rules) == 0 {
+		return ""
+	}
+	return "@keyframes " + name + " {" + strings.Join(rules, "") + "}"
+}
+
+// keyframeOffsetPercent 把 offset（数字 0..1 或 "0%"/"50%"）转成百分数 0..100。
+func keyframeOffsetPercent(raw json.RawMessage) float64 {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		s = strings.TrimSpace(s)
+		if strings.HasSuffix(s, "%") {
+			v, err := strconv.ParseFloat(strings.TrimSuffix(s, "%"), 64)
+			if err != nil {
+				return -1
+			}
+			return v
+		}
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return -1
+		}
+		return v * 100
+	}
+	var f float64
+	if err := json.Unmarshal(raw, &f); err == nil {
+		return f * 100
+	}
+	return -1
+}
+
+// keyframePropName 把后端 kebab 属性名映射成 CSS 属性名；不可动画/未知返回空串。
+func keyframePropName(k string) string {
+	switch strings.ToLower(k) {
+	case "opacity":
+		return "opacity"
+	case "transform":
+		return "transform"
+	case "color":
+		return "color"
+	case "bg", "background":
+		return "background-color"
+	case "width":
+		return "width"
+	case "height":
+		return "height"
+	case "font-size":
+		return "font-size"
+	case "border-radius":
+		return "border-radius"
+	default:
+		return ""
+	}
+}
+
+func pctStr(p float64) string {
+	return strconv.FormatFloat(p, 'g', -1, 64) + "%"
 }
 
 // 选区自定义属性名（内联写到元素 style 上）。

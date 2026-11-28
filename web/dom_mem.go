@@ -28,6 +28,9 @@ type memElem struct {
 	styles   map[string]string
 	canvas   []string // canvas 指令 JSON 历史
 	richHTML string   // 最近一次 innerHTML 写入的富文本片段（测试断言用）
+	// animation / animation-keyframes 顺序不定，缓存后统一重算 CSS animation。
+	animValue  string
+	animFrames string
 	parent   ElemID
 	children []ElemID
 	listeners map[string]func(FiredEvent)
@@ -147,9 +150,25 @@ func (d *memDriver) SetAttr(e ElemID, key, value string) {
 		}
 		return
 	}
-	// animation 与浏览器同构：记录翻译后的原生 CSS animation 值，空/非法值删除。
-	if strings.EqualFold(key, "animation") {
-		css := animationCSS(value)
+	// animation / animation-keyframes 与浏览器同构：缓存后统一重算，
+	// 自定义关键帧按内容 hash 命名（mem 驱动只需记录最终 animation 值，
+	// @keyframes 实体由 js 驱动注入；mem 侧把帧名写进 animation 供断言）。
+	if strings.EqualFold(key, "animation") || strings.EqualFold(key, "animation-keyframes") {
+		if strings.EqualFold(key, "animation") {
+			el.animValue = value
+		} else {
+			el.animFrames = value
+		}
+		var css string
+		if strings.TrimSpace(el.animFrames) != "" {
+			kfName := keyframesCSSName(el.animFrames)
+			if buildKeyframesCSS(el.animFrames, kfName) != "" {
+				css = animationCSSWithKeyframes(el.animValue, kfName)
+			}
+		}
+		if css == "" {
+			css = animationCSS(el.animValue)
+		}
 		if css == "" {
 			delete(el.styles, "animation")
 		} else {
