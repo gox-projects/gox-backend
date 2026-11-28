@@ -376,6 +376,13 @@ impl Renderer {
         id
     }
 
+    /// 描边最终 alpha：border 颜色 alpha（如 #ffffff14 = 20/255 发丝高光）
+    /// 乘节点整体 opacity。旧实现硬编码 255，把半透明高光画成纯白实线。
+    /// 抽成纯函数以便单测覆盖「alpha 保留」这一契约。
+    pub(crate) fn border_draw_alpha(rgba_alpha: u8, node_alpha: f32) -> f32 {
+        rgba_alpha as f32 * node_alpha.clamp(0.0, 1.0)
+    }
+
     /// 把 DisplayList 编译成 GpuFrame。绘制序与旧 tiny-skia 管线逐 shape 一致：
     /// shadow → bg → gradient → img/video → canvas → border；随后 selection
     /// 背景、滚动条 thumb（overlay）；glyphon 文本由 render 在同一 pass 最后叠加。
@@ -536,15 +543,20 @@ impl Renderer {
                     );
                 }
             }
-            // 描边：带心环（GPU band / CPU stroke 同几何）；旧实现强制不透明。
+            // 描边：内侧环（CSS border 语义，f309dc4 已统一 GPU/CPU 几何）。
+            // border 颜色的 alpha 必须保留（如 #ffffff14 = 8% 发丝高光），并乘入
+            // 节点整体 opacity；旧实现硬编码 255，把半透明高光画成纯白实线。
             if let Some((c, bw)) = s.border {
-                f.quad(
-                    [rx, ry, rw, rh],
-                    clip,
-                    [c.0 as f32, c.1 as f32, c.2 as f32, 255.0],
-                    s.radius,
-                    bw,
-                );
+                let border_a = Self::border_draw_alpha(c.3, s.alpha);
+                if border_a > 0.0 {
+                    f.quad(
+                        [rx, ry, rw, rh],
+                        clip,
+                        [c.0 as f32, c.1 as f32, c.2 as f32, border_a],
+                        s.radius,
+                        bw,
+                    );
+                }
             }
         }
         // 三端统一 selection：在文字层之前画选区背景矩形（glyphon 文字随后绘制）。
@@ -1929,5 +1941,33 @@ mod region_tests {
         assert_eq!(rects[0], crate::passthrough::InputRect { x: 20, y: 40, w: 60, h: 80 });
         assert_eq!(rects[1], crate::passthrough::InputRect { x: 200, y: 400, w: 100, h: 50 });
         assert_eq!(rects[2], crate::passthrough::InputRect { x: 480, y: 440, w: 20, h: 10 }, "越界部分裁掉");
+    }
+}
+
+#[cfg(test)]
+mod border_alpha_tests {
+    use super::Renderer;
+
+    /// 描边 alpha = border 色 alpha × 节点 opacity，绝不硬编码 255。
+    /// 回归：Modal 发丝高光 #ffffff14 曾因硬编码 255 被画成纯白实线。
+    #[test]
+    fn border_draw_alpha_preserves_hairline_alpha() {
+        let hairline_a = 0x14u8; // #ffffff14 的 alpha = 20/255 ≈ 8%
+        // 全不透明节点：alpha 原样保留，不是 255。
+        assert_eq!(Renderer::border_draw_alpha(hairline_a, 1.0), 20.0);
+        // 半透明节点：两者相乘（舍入误差内）。
+        assert!((Renderer::border_draw_alpha(hairline_a, 0.5) - 10.0).abs() < 0.001);
+        assert!((Renderer::border_draw_alpha(0x66, 0.5) - 51.0).abs() < 0.001);
+        // 完全透明节点不画描边。
+        assert_eq!(Renderer::border_draw_alpha(hairline_a, 0.0), 0.0);
+        // 不透明描边色（无 alpha 通道）仍是 255。
+        assert_eq!(Renderer::border_draw_alpha(255, 1.0), 255.0);
+    }
+
+    #[test]
+    fn border_draw_alpha_clamps_node_opacity() {
+        // opacity 越界不得放大描边 alpha。
+        assert_eq!(Renderer::border_draw_alpha(200, 1.5), 200.0);
+        assert_eq!(Renderer::border_draw_alpha(200, -0.3), 0.0);
     }
 }

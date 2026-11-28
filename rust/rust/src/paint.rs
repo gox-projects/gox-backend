@@ -471,7 +471,9 @@ pub(crate) struct ShapeDraw {
     /// 与文字渐变互斥：带 gradient-text 的 div 其渐变只裁剪到文字，不画背景。
     pub(crate) bg_gradient: Option<crate::text_effects::LinearGradient>,
     pub(crate) radius: f32,
-    pub(crate) border: Option<((u8, u8, u8), f32)>,
+    /// 描边色（含 alpha）与线宽。CSS border 可为半透明高光（如 #ffffff14），
+    /// alpha 必须保留并在 draw 时乘入，否则发丝高光被画成纯白实线。
+    pub(crate) border: Option<((u8, u8, u8, u8), f32)>,
     pub(crate) shadow: Option<crate::style::BoxShadow>,
     pub(crate) clip: ClipRect,
     /// img 原语：解码后的图片 + object-fit；None 表示普通矩形。
@@ -1461,7 +1463,11 @@ impl DisplayList {
                 let radius = p("border-radius").and_then(parse_px).unwrap_or(0.0);
                 let border = p("border").map(|c| {
                     let bw = p("border-width").and_then(parse_px).unwrap_or(1.0);
-                    (parse_color(c), bw)
+                    // 与背景色同理：border 可能是半透明高光 token（#ffffff14 = 8% 白），
+                    // 必须用 parse_color_rgba 保留 alpha；旧实现用 parse_color 丢掉
+                    // alpha 再在 render 里硬编码 255，把发丝高光画成纯白实线。
+                    let rgba = crate::style::parse_color_rgba(c).unwrap_or((255, 255, 255, 255));
+                    (rgba, bw)
                 });
                 if !clip_rejects(my_clip, x, y, w, h) {
                     // img 原语：<img src> 走原生解码（data URI / 本地路径），与 Go 端

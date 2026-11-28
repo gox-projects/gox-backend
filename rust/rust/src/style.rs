@@ -1087,4 +1087,29 @@ mod parity_tests {
         };
         assert_eq!(parse_style(&n).z_index, -5);
     }
+
+    // ---- 描边 alpha 保留回归：Modal 发丝高光 #ffffff14 不得被画成纯白实线 ----
+
+    #[test]
+    fn parse_color_rgba_keeps_alpha_for_hairline_tokens() {
+        // AppleTheme 真实 token：8% 白高光描边、60% 黑遮罩、95% 不透明面板。
+        assert_eq!(parse_color_rgba("#ffffff14"), Some((255, 255, 255, 0x14)));
+        assert_eq!(parse_color_rgba("#00000099"), Some((0, 0, 0, 0x99)));
+        assert_eq!(parse_color_rgba("#1e1e1ef2"), Some((0x1e, 0x1e, 0x1e, 0xf2)));
+        // 大小写不敏感；不带 alpha 的 6 位 hex 补 255。
+        assert_eq!(parse_color_rgba("#FFFFFF14"), Some((255, 255, 255, 0x14)));
+        assert_eq!(parse_color_rgba("#ffffff"), Some((255, 255, 255, 255)));
+        // 3 位缩写扩位后 alpha=255。
+        assert_eq!(parse_color_rgba("#fff"), Some((255, 255, 255, 255)));
+        // 旧 parse_color 会丢掉 alpha——固化差异，防止有人用它解析 border。
+        assert_eq!(crate::util::parse_color("#ffffff14"), (255, 255, 255));
+    }
+
+    #[test]
+    fn parse_box_shadow_keeps_alpha() {
+        // ShadowModal = "0 20px 56px 0 #00000066" 的 alpha 必须保留。
+        let sh = parse_box_shadow("0 20px 56px 0 #00000066").unwrap();
+        assert_eq!((sh.offset_y, sh.blur, sh.spread), (20.0, 56.0, 0.0));
+        assert_eq!(sh.color, (0, 0, 0, 0x66));
+    }
 }
