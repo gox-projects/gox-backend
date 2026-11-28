@@ -19,6 +19,8 @@ pub enum Overflow {
     Auto,
 }
 
+/// 缓动函数。四档关键字走 Web 标准 cubic-bezier 曲线；自定义 cubic-bezier(x1,y1,x2,y2)
+/// 与 CSS 语义一致（控制点 x 限 0..=1，y 不限，与浏览器一致）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Easing {
     Linear,
@@ -26,6 +28,21 @@ pub enum Easing {
     EaseIn,
     EaseOut,
     EaseInOut,
+    CubicBezier(f32, f32, f32, f32),
+}
+
+impl Easing {
+    /// 展开为 cubic-bezier 的四个控制点（CSS 标准值）。
+    fn points(self) -> (f32, f32, f32, f32) {
+        match self {
+            Easing::Linear => (0.0, 0.0, 1.0, 1.0),
+            Easing::Ease => (0.25, 0.1, 0.25, 1.0),
+            Easing::EaseIn => (0.42, 0.0, 1.0, 1.0),
+            Easing::EaseOut => (0.0, 0.0, 0.58, 1.0),
+            Easing::EaseInOut => (0.42, 0.0, 0.58, 1.0),
+            Easing::CubicBezier(x1, y1, x2, y2) => (x1, y1, x2, y2),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -37,7 +54,7 @@ pub struct BoxShadow {
     pub color: (u8, u8, u8, u8), // ARGB alpha
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform {
     pub translate_x: f32,
     pub translate_y: f32,
@@ -463,9 +480,100 @@ pub fn parse_color_rgba(s: &str) -> Option<(u8, u8, u8, u8)> {
     })
 }
 
+/// 解析时长 token（"300ms" / "0.4s" / "400" 无单位视为 ms）。失败返回 None。
+fn parse_duration_token(t: &str) -> Option<f32> {
+    if let Some(x) = t.strip_suffix("ms") {
+        return x.parse::<f32>().ok();
+    }
+    if let Some(x) = t.strip_suffix('s') {
+        return x.parse::<f32>().ok().map(|v| v * 1000.0);
+    }
+    t.parse::<f32>().ok()
+}
+
+/// 解析 "cubic-bezier(x1,y1,x2,y2)"：x1/x2 钳到 0..=1（CSS 规范要求，保证 x(s) 单调），
+/// y1/y2 不钳（允许过冲）。非法返回 None。
+fn parse_cubic_bezier(t: &str) -> Option<Easing> {
+    let low = t.to_ascii_lowercase();
+    let inner = low.strip_prefix("cubic-bezier(")?.strip_suffix(')')?;
+    let p: Vec<&str> = inner.split(',').collect();
+    if p.len() != 4 {
+        return None;
+    }
+    let x1 = p[0].trim().parse::<f32>().ok()?;
+    let y1 = p[1].trim().parse::<f32>().ok()?;
+    let x2 = p[2].trim().parse::<f32>().ok()?;
+    let y2 = p[3].trim().parse::<f32>().ok()?;
+    if !x1.is_finite() || !y1.is_finite() || !x2.is_finite() || !y2.is_finite() {
+        return None;
+    }
+    Some(Easing::CubicBezier(
+        x1.clamp(0.0, 1.0),
+        y1,
+        x2.clamp(0.0, 1.0),
+        y2,
+    ))
+}
+
+/// 把 transition 声明按顶层逗号切段，跳过 cubic-bezier(...) 内部的逗号。
+fn split_transition_segments(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            ',' if depth == 0 => {
+                out.push(s[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].to_string());
+    out
+}
+
+/// 把一段 transition 声明切成 token，cubic-bezier(...) 整体作为一个 token
+/// （按顶层空白切，括号内空白不切）。
+fn transition_tokens(seg: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in seg.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+                cur.push(c);
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 pub fn parse_transition(s: &str) -> Vec<TransitionItem> {
     let mut out = Vec::new();
-    for seg in s.split(',') {
+    for seg in split_transition_segments(s) {
         let seg = seg.trim();
         if seg.is_empty() || seg.eq_ignore_ascii_case("none") {
             continue;
@@ -476,16 +584,19 @@ pub fn parse_transition(s: &str) -> Vec<TransitionItem> {
             delay: 0.0,
             easing: Easing::Ease,
         };
-        for tok in seg.split_whitespace() {
+        // CSS 简写中两个时长按出现顺序为 duration、delay。
+        let mut durations_seen = 0;
+        for tok in transition_tokens(seg) {
             let t = tok.to_ascii_lowercase();
-            if let Some(x) = t.strip_suffix("ms") {
-                if let Ok(v) = x.parse() {
+            if let Some(cb) = parse_cubic_bezier(&t) {
+                it.easing = cb;
+            } else if let Some(v) = parse_duration_token(&t) {
+                if durations_seen == 0 {
                     it.duration = v;
+                } else if durations_seen == 1 {
+                    it.delay = v;
                 }
-            } else if let Some(x) = t.strip_suffix('s') {
-                if let Ok(v) = x.parse::<f32>() {
-                    it.duration = v * 1000.0;
-                }
+                durations_seen += 1;
             } else {
                 match t.as_str() {
                     "linear" => it.easing = Easing::Linear,
@@ -508,21 +619,69 @@ pub fn parse_transition(s: &str) -> Vec<TransitionItem> {
     out
 }
 
+/// 三次贝塞尔在参数 s 处的取值：3(1-s)²s·p1 + 3(1-s)s²·p2 + s³。
+/// p0=0、p3=1 固定（CSS cubic-bezier 曲线端点恒为 (0,0) 与 (1,1)）。
+#[inline]
+fn cubic_bezier_at(s: f32, p1: f32, p2: f32) -> f32 {
+    let one_s = 1.0 - s;
+    3.0 * one_s * one_s * s * p1 + 3.0 * one_s * s * s * p2 + s * s * s
+}
+
+/// 三次贝塞尔在参数 s 处的导数，用于牛顿迭代。
+#[inline]
+fn cubic_bezier_slope(s: f32, p1: f32, p2: f32) -> f32 {
+    let one_s = 1.0 - s;
+    3.0 * one_s * one_s * p1 + 6.0 * one_s * s * (p2 - p1) + 3.0 * s * s * (1.0 - p2)
+}
+
+/// 求 Web 标准 cubic-bezier(x1,y1,x2,y2) 在进度 t（时间比 0..=1）下的输出。
+///
+/// 算法：解 x(s)=t 得参数 s，再取 y(s)。先用牛顿迭代（8 步，收敛快），
+/// 导数退化时回退二分（16 步，稳定）。x1/x2 被 parse_transition 约束在 0..=1，
+/// 保证 x(s) 单调、解唯一。端点直接返回，规避浮点误差。
 pub fn easing_value(e: Easing, t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
-    match e {
-        Easing::Linear => t,
-        Easing::EaseIn => t * t * t,
-        Easing::EaseOut => 1.0 - (1.0 - t).powi(3),
-        Easing::EaseInOut => {
-            if t < 0.5 {
-                4.0 * t * t * t
-            } else {
-                1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
-            }
-        }
-        Easing::Ease => t * t * (3.0 - 2.0 * t),
+    if t == 0.0 || t == 1.0 {
+        return t;
     }
+    let (x1, y1, x2, y2) = e.points();
+    if x1 == y1 && x2 == y2 {
+        return t; // linear 特例
+    }
+    // 牛顿迭代
+    let mut s = t;
+    let mut solved = false;
+    for _ in 0..8 {
+        let x = cubic_bezier_at(s, x1, x2) - t;
+        if x.abs() < 1e-6 {
+            solved = true;
+            break;
+        }
+        let d = cubic_bezier_slope(s, x1, x2);
+        if d.abs() < 1e-6 {
+            break; // 退化，交给二分
+        }
+        s -= x / d;
+        s = s.clamp(0.0, 1.0);
+    }
+    if !solved {
+        // 二分兜底：x(s) 在 0..1 单调
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        s = t;
+        for _ in 0..24 {
+            let cx = cubic_bezier_at(s, x1, x2);
+            if (cx - t).abs() < 1e-6 {
+                break;
+            }
+            if cx < t {
+                lo = s;
+            } else {
+                hi = s;
+            }
+            s = (lo + hi) * 0.5;
+        }
+    }
+    cubic_bezier_at(s.clamp(0.0, 1.0), y1, y2)
 }
 
 // ---------- 伪状态样式覆盖（&:hover / &:active） ----------
@@ -626,13 +785,115 @@ pub fn apply_pseudo_state(
 
 // ---------- transition 插值引擎 ----------
 
+/// 可插值属性的一类值。四类分别走不同的插值/序列化路径。
+#[derive(Clone, Debug, PartialEq)]
+enum AnimValue {
+    Number(f32),
+    /// (r,g,b,a)，逐通道线性插值（含 alpha）。
+    Color((u8, u8, u8, u8)),
+    /// transform 三个分量（translate_x, translate_y, scale）逐分量插值。
+    Transform(Transform),
+}
+
+impl AnimValue {
+    /// 按属性名与 props 解析目标值。返回 None 表示该属性不可动画/值非法。
+    fn parse(property: &str, props: &HashMap<String, String>) -> Option<Self> {
+        let raw = props.get(property)?.as_str();
+        if is_color_prop(property) {
+            return parse_color_rgba(raw).map(Self::Color);
+        }
+        if property.eq_ignore_ascii_case("transform") {
+            return Some(Self::Transform(parse_transform(raw)));
+        }
+        parse_px(raw).map(Self::Number)
+    }
+
+    /// 线性插值（t 已经过缓动）。
+    fn lerp(&self, to: &Self, t: f32) -> Self {
+        match (self, to) {
+            (Self::Number(a), Self::Number(b)) => Self::Number(a + (b - a) * t),
+            (Self::Color((ar, ag, ab, aa)), Self::Color((br, bg, bb, ba))) => {
+                let ch = |a: u8, b: u8| -> u8 {
+                    let v = a as f32 + (b as f32 - a as f32) * t;
+                    v.round().clamp(0.0, 255.0) as u8
+                };
+                Self::Color((ch(*ar, *br), ch(*ag, *bg), ch(*ab, *bb), ch(*aa, *ba)))
+            }
+            (Self::Transform(a), Self::Transform(b)) => Self::Transform(Transform {
+                translate_x: a.translate_x + (b.translate_x - a.translate_x) * t,
+                translate_y: a.translate_y + (b.translate_y - a.translate_y) * t,
+                scale: a.scale + (b.scale - a.scale) * t,
+            }),
+            _ => self.clone(), // 类型不一致（不该发生）：保守保持起点
+        }
+    }
+
+    /// 序列化回 props 字符串；下游 parse_style / parse_px / parse_color_rgba 能再解析。
+    /// 颜色用 #rrggbbaa 十六进制——避免 rgba() 中 alpha=1 被误判为 0..1 浮点（→255）。
+    fn to_prop(&self) -> String {
+        match self {
+            Self::Number(v) => format!("{:.3}", v),
+            Self::Color((r, g, b, a)) => format!("#{:02x}{:02x}{:02x}{:02x}", r, g, b, a),
+            Self::Transform(t) => format!(
+                "translate({:.3}px, {:.3}px) scale({:.3})",
+                t.translate_x, t.translate_y, t.scale
+            ),
+        }
+    }
+}
+
+/// 颜色属性集合（与 docs/STYLE.md §3 一致：color/bg/background/border）。
+fn is_color_prop(property: &str) -> bool {
+    matches!(
+        property.to_ascii_lowercase().as_str(),
+        "color" | "bg" | "background" | "border" | "border-color" | "shadow-color"
+    )
+}
+
+/// `all` 展开时要枚举的可动画属性。只含 parse_style 真正消费、且可插值的属性，
+/// 避免把 transition/事件等非样式键当成动画目标。
+const ANIMATABLE_PROPS: &[&str] = &[
+    "opacity",
+    "width",
+    "height",
+    "font-size",
+    "padding",
+    "margin",
+    "gap",
+    "row-gap",
+    "column-gap",
+    "border-radius",
+    "border-width",
+    "top",
+    "right",
+    "bottom",
+    "left",
+    "min-width",
+    "max-width",
+    "min-height",
+    "max-height",
+    "flex-grow",
+    "flex-shrink",
+    "z-index",
+    "line-height",
+    "letter-spacing",
+    "scroll-top",
+    "scroll-left",
+    "color",
+    "bg",
+    "background",
+    "border",
+    "transform",
+];
+
 /// 正在进行的单属性动画。
 #[derive(Clone, Debug)]
 struct Anim {
-    from: f32,
-    to: f32,
+    from: AnimValue,
+    to: AnimValue,
     start_ms: u128,
     duration: f32,
+    delay: f32,
     easing: Easing,
 }
 
@@ -644,7 +905,7 @@ type AnimMap = HashMap<(String, String), Anim>;
 /// 覆盖是浅拷贝（只克隆变化节点的 props），不污染常驻镜像树。
 pub struct Animator {
     anims: AnimMap,
-    targets: HashMap<(String, String), f32>,
+    targets: HashMap<(String, String), AnimValue>,
     now_ms: u128,
     /// 本帧 apply 看到的活跃声明式动画（周期动画无外部事件唤醒，据此维持重绘）。
     has_animation: bool,
@@ -675,17 +936,21 @@ impl Animator {
     }
 
     /// 返回当前插值值（若动画已结束则返回 to 并移除动画）。
-    fn sample(&mut self, key: &(String, String)) -> Option<f32> {
+    /// delay 期间固定在 from；delay 结束后按 (elapsed-delay)/duration 推进。
+    fn sample(&mut self, key: &(String, String)) -> Option<AnimValue> {
         let now = self.now_ms;
         let a = self.anims.get(key)?;
         let elapsed = now.saturating_sub(a.start_ms) as f32;
-        if elapsed >= a.duration {
-            let to = a.to;
+        let active = elapsed - a.delay;
+        if active >= a.duration {
+            let to = a.to.clone();
             self.anims.remove(key);
             Some(to)
+        } else if active < 0.0 {
+            Some(a.from.clone()) // 延迟阶段：停在起点
         } else {
-            let t = easing_value(a.easing, elapsed / a.duration);
-            Some(a.from + (a.to - a.from) * t)
+            let t = easing_value(a.easing, active / a.duration);
+            Some(a.from.lerp(&a.to, t))
         }
     }
 
@@ -695,6 +960,40 @@ impl Animator {
         let mut out = root.clone();
         self.apply_node(root, &mut out);
         out
+    }
+
+    /// 对单个 transition 项启动/推进动画。property 已经过 all 展开。
+    fn animate_property(
+        &mut self,
+        src: &SceneNode,
+        dst: &mut SceneNode,
+        property: &str,
+        tr: &TransitionItem,
+    ) {
+        let Some(target) = AnimValue::parse(property, &src.props) else {
+            return;
+        };
+        let key = (src.id.clone(), property.to_string());
+        let prev = self.targets.get(&key).cloned();
+        if prev.as_ref() != Some(&target) {
+            // 目标变化：从「当前插值值」起新动画，平滑衔接中途改向。
+            let from = self.sample(&key).or(prev).unwrap_or_else(|| target.clone());
+            self.anims.insert(
+                key.clone(),
+                Anim {
+                    from,
+                    to: target.clone(),
+                    start_ms: self.now_ms,
+                    duration: tr.duration,
+                    delay: tr.delay,
+                    easing: tr.easing,
+                },
+            );
+            self.targets.insert(key.clone(), target);
+        }
+        if let Some(v) = self.sample(&key) {
+            dst.props.insert(property.to_string(), v.to_prop());
+        }
     }
 
     fn apply_node(&mut self, src: &SceneNode, dst: &mut SceneNode) {
@@ -707,42 +1006,23 @@ impl Animator {
                 dst.props.insert("opacity".into(), format!("{:.3}", op));
             }
         }
-        // 收集该节点的 transition 声明（属性名 -> duration/easing）。
+        // 收集该节点的 transition 声明。
         let trs = parse_transition(
             src.props
                 .get("transition")
                 .map(|s| s.as_str())
                 .unwrap_or(""),
         );
-        if !trs.is_empty() {
-            for tr in &trs {
-                if tr.property == "all" {
-                    continue;
-                } // all 需要枚举属性，留作后续
-                let key = (src.id.clone(), tr.property.clone());
-                let target = src.props.get(&tr.property).and_then(|s| parse_px(s));
-                // 颜色属性用特殊通道，这里只处理数值属性。
-                if let Some(target) = target {
-                    let prev = self.targets.get(&key).copied();
-                    if prev != Some(target) {
-                        // 目标变化：从「当前插值值」起新动画，平滑衔接。
-                        let from = self.sample(&key).or(prev).unwrap_or(target);
-                        self.anims.insert(
-                            key.clone(),
-                            Anim {
-                                from,
-                                to: target,
-                                start_ms: self.now_ms,
-                                duration: tr.duration,
-                                easing: tr.easing,
-                            },
-                        );
-                        self.targets.insert(key.clone(), target);
-                    }
-                    if let Some(v) = self.sample(&key) {
-                        dst.props.insert(tr.property.clone(), format!("{:.3}", v));
+        for tr in &trs {
+            if tr.property == "all" {
+                // all 展开为节点上实际存在且可动画的属性，各自套用同一时长/缓动。
+                for &p in ANIMATABLE_PROPS {
+                    if src.props.contains_key(p) {
+                        self.animate_property(src, dst, p, tr);
                     }
                 }
+            } else {
+                self.animate_property(src, dst, &tr.property, tr);
             }
         }
         for (i, c) in src.children.iter().enumerate() {
@@ -895,11 +1175,81 @@ mod tests {
     }
 
     #[test]
-    fn easing_curve() {
-        assert_eq!(easing_value(Easing::Linear, 0.5), 0.5);
-        assert!(easing_value(Easing::EaseIn, 0.5) < 0.2);
-        assert!(easing_value(Easing::EaseOut, 0.5) > 0.8);
-        assert!((easing_value(Easing::EaseInOut, 0.5) - 0.5).abs() < 0.01);
+    fn easing_curve_matches_web_standard() {
+        // 标准 CSS cubic-bezier 曲线，数值由浏览器同款求解器算出。
+        // linear
+        assert!((easing_value(Easing::Linear, 0.25) - 0.25).abs() < 0.001);
+        assert!((easing_value(Easing::Linear, 0.5) - 0.5).abs() < 0.001);
+        // ease = cubic-bezier(.25,.1,.25,1)
+        assert!((easing_value(Easing::Ease, 0.25) - 0.40851).abs() < 0.005);
+        assert!((easing_value(Easing::Ease, 0.5) - 0.80240).abs() < 0.005);
+        assert!((easing_value(Easing::Ease, 0.75) - 0.96046).abs() < 0.005);
+        // ease-in = cubic-bezier(.42,0,1,1)
+        assert!((easing_value(Easing::EaseIn, 0.25) - 0.09346).abs() < 0.005);
+        assert!((easing_value(Easing::EaseIn, 0.5) - 0.31536).abs() < 0.005);
+        assert!((easing_value(Easing::EaseIn, 0.75) - 0.62186).abs() < 0.005);
+        // ease-out = cubic-bezier(0,0,.58,1)
+        assert!((easing_value(Easing::EaseOut, 0.25) - 0.37814).abs() < 0.005);
+        assert!((easing_value(Easing::EaseOut, 0.5) - 0.68464).abs() < 0.005);
+        assert!((easing_value(Easing::EaseOut, 0.75) - 0.90654).abs() < 0.005);
+        // ease-in-out = cubic-bezier(.42,0,.58,1)（对称）
+        assert!((easing_value(Easing::EaseInOut, 0.25) - 0.12916).abs() < 0.005);
+        assert!((easing_value(Easing::EaseInOut, 0.5) - 0.5).abs() < 0.005);
+        assert!((easing_value(Easing::EaseInOut, 0.75) - 0.87084).abs() < 0.005);
+        // 端点
+        assert_eq!(easing_value(Easing::Ease, 0.0), 0.0);
+        assert_eq!(easing_value(Easing::Ease, 1.0), 1.0);
+        // 超出区间钳制
+        assert_eq!(easing_value(Easing::Ease, -0.5), 0.0);
+        assert_eq!(easing_value(Easing::Ease, 1.5), 1.0);
+    }
+
+    #[test]
+    fn easing_custom_cubic_bezier() {
+        // 自定义曲线与 Web cubic-bezier() 一致；x 越界钳到 0..1（与浏览器一致）。
+        let ease_in = Easing::CubicBezier(0.42, 0.0, 1.0, 1.0);
+        assert!((easing_value(ease_in, 0.5) - 0.31536).abs() < 0.005);
+        // y 允许过冲（back）
+        let back = Easing::CubicBezier(0.34, 1.56, 0.64, 1.0);
+        assert!(easing_value(back, 0.5) > 1.0, "back 曲线中段应过冲 >1");
+        assert_eq!(easing_value(back, 1.0), 1.0, "端点仍为 1");
+        // 直接构造越界的 x 控制点也应稳定、不 panic、输出有限。
+        let clamped = Easing::CubicBezier(-1.0, 0.0, 2.0, 1.0);
+        for i in 0..=10 {
+            let v = easing_value(clamped, i as f32 / 10.0);
+            assert!(v.is_finite(), "越界控制点输出应有限");
+        }
+    }
+
+    #[test]
+    fn parse_transition_cubic_bezier_and_delay() {
+        let items = parse_transition(
+            "opacity 300ms cubic-bezier(0.4, 0, 0.2, 1) 100ms, transform 0.2s ease-in 50ms",
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].property, "opacity");
+        assert_eq!(items[0].duration, 300.0);
+        assert_eq!(items[0].delay, 100.0);
+        assert_eq!(items[0].easing, Easing::CubicBezier(0.4, 0.0, 0.2, 1.0));
+        assert_eq!(items[1].property, "transform");
+        assert_eq!(items[1].duration, 200.0);
+        assert_eq!(items[1].delay, 50.0);
+        assert_eq!(items[1].easing, Easing::EaseIn);
+    }
+
+    #[test]
+    fn parse_transition_cubic_bezier_ignores_internal_commas() {
+        let items = parse_transition("width 1s cubic-bezier(0.1, 0.9, 0.2, 1)");
+        assert_eq!(items.len(), 1, "括号内逗号不应切出多条 transition");
+        assert_eq!(items[0].easing, Easing::CubicBezier(0.1, 0.9, 0.2, 1.0));
+    }
+
+    #[test]
+    fn parse_transition_invalid_cubic_bezier_falls_back() {
+        // 非法曲线不 panic，回退到 default ease。
+        let items = parse_transition("width 300ms cubic-bezier(0.1, 0.2)");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].easing, Easing::Ease);
     }
 
     #[test]
@@ -1006,6 +1356,150 @@ mod tests {
         assert_eq!(out1.props["opacity"], "0.000");
         // 常驻树不被污染
         assert!(!n.props.contains_key("opacity"));
+    }
+
+    #[test]
+    fn animator_interpolates_color() {
+        let mut a = Animator::new();
+        let mut n = node(&[("transition", "bg 200ms linear"), ("bg", "#000000")]);
+        n.id = "card".into();
+        a.set_now(0);
+        let out = a.apply(&n);
+        assert_eq!(out.props["bg"], "#000000ff");
+        n.props.insert("bg".into(), "#ffffff".into());
+        a.set_now(1000);
+        let out = a.apply(&n);
+        assert_eq!(out.props["bg"], "#000000ff", "t=0 停在起点");
+        a.set_now(1100);
+        let out = a.apply(&n);
+        assert_eq!(out.props["bg"], "#808080ff", "中点应为中灰");
+        a.set_now(1200);
+        let out = a.apply(&n);
+        assert_eq!(out.props["bg"], "#ffffffff", "结束为白");
+    }
+
+    #[test]
+    fn animator_interpolates_color_alpha() {
+        let mut a = Animator::new();
+        let mut n = node(&[("transition", "color 200ms linear"), ("color", "#ff000000")]);
+        n.id = "fade".into();
+        a.set_now(0);
+        a.apply(&n);
+        n.props.insert("color".into(), "#ff0000ff".into());
+        a.set_now(1000);
+        a.apply(&n);
+        a.set_now(1100);
+        let out = a.apply(&n);
+        assert_eq!(out.props["color"], "#ff000080", "alpha 中点约 128");
+    }
+
+    #[test]
+    fn animator_interpolates_transform() {
+        let mut a = Animator::new();
+        let mut n = node(&[
+            ("transition", "transform 200ms linear"),
+            ("transform", "translate(0px, 0px) scale(1)"),
+        ]);
+        n.id = "box".into();
+        a.set_now(0);
+        a.apply(&n);
+        n.props.insert(
+            "transform".into(),
+            "translate(100px, -40px) scale(2)".into(),
+        );
+        a.set_now(1000); // 在 1000 启动动画
+        a.apply(&n);
+        a.set_now(1100); // 中点
+        let out = a.apply(&n);
+        let t = parse_transform(&out.props["transform"]);
+        assert!((t.translate_x - 50.0).abs() < 1.0, "tx 中点≈50");
+        assert!((t.translate_y - (-20.0)).abs() < 1.0, "ty 中点≈-20");
+        assert!((t.scale - 1.5).abs() < 0.01, "scale 中点≈1.5");
+    }
+
+    #[test]
+    fn animator_honors_delay() {
+        let mut a = Animator::new();
+        let mut n = node(&[("transition", "width 200ms linear 100ms"), ("width", "0")]);
+        n.id = "delayed".into();
+        a.set_now(0);
+        a.apply(&n);
+        n.props.insert("width".into(), "100".into());
+        a.set_now(1000);
+        let out = a.apply(&n);
+        assert_eq!(out.props["width"], "0.000", "delay 期间停在起点");
+        a.set_now(1099);
+        let out = a.apply(&n);
+        let v: f32 = out.props["width"].parse().unwrap();
+        assert!(v < 1.0, "delay 未结束仍 near 起点");
+        a.set_now(1200); // delay 100 + duration 200 → 动画中点 1000+100+100
+        let out = a.apply(&n);
+        let v: f32 = out.props["width"].parse().unwrap();
+        assert!((v - 50.0).abs() < 2.0, "delay 后中点≈50，got {}", v);
+        a.set_now(1300); // delay 100 + duration 200 结束
+        let out = a.apply(&n);
+        assert_eq!(out.props["width"], "100.000");
+    }
+
+    #[test]
+    fn animator_all_expands_present_props() {
+        let mut a = Animator::new();
+        let mut n = node(&[
+            ("transition", "all 200ms linear"),
+            ("opacity", "0"),
+            ("width", "0"),
+            ("bg", "#000000"),
+            ("transition-all-ignore", "keep"),
+        ]);
+        n.id = "allnode".into();
+        a.set_now(0);
+        a.apply(&n);
+        n.props.insert("opacity".into(), "1".into());
+        n.props.insert("width".into(), "50".into());
+        n.props.insert("bg".into(), "#ffffff".into());
+        n.props
+            .insert("transition-all-ignore".into(), "changed".into());
+        a.set_now(1000); // 启动动画
+        a.apply(&n);
+        a.set_now(1100); // 中点
+        let out = a.apply(&n);
+        let op: f32 = out.props["opacity"].parse().unwrap();
+        let w: f32 = out.props["width"].parse().unwrap();
+        assert!((op - 0.5).abs() < 0.02, "opacity 中点≈0.5");
+        assert!((w - 25.0).abs() < 1.0, "width 中点≈25");
+        assert_eq!(out.props["bg"], "#808080ff", "bg 中点灰");
+        assert_eq!(
+            out.props["transition-all-ignore"], "changed",
+            "非白名单属性不被 all 动画改写"
+        );
+    }
+
+    #[test]
+    fn animator_color_retarget_smooth() {
+        // 中途改向：从当前插值色起新动画，不跳变。
+        let mut a = Animator::new();
+        let mut n = node(&[("transition", "bg 200ms linear"), ("bg", "#000000")]);
+        n.id = "rt".into();
+        a.set_now(0);
+        a.apply(&n);
+        n.props.insert("bg".into(), "#ffffff".into());
+        a.set_now(1000);
+        a.apply(&n);
+        a.set_now(1100); // 50% → 中灰
+        let mid = a.apply(&n);
+        let mid_color = mid.props["bg"].clone();
+        // mid_color≈#808080，解析出当前通道作为改向起点。
+        let (mr, _, _, _) = parse_color_rgba(&mid_color).unwrap();
+        assert!((mr as i32 - 128).abs() <= 1, "中点应≈128，got {}", mr);
+        // 改向到纯红：改向瞬间应从「当前色」平滑接续，不跳变。
+        n.props.insert("bg".into(), "#ff0000".into());
+        a.set_now(1101);
+        let out = a.apply(&n);
+        let (rr, _, _, _) = parse_color_rgba(&out.props["bg"]).unwrap();
+        assert!((rr as i32 - mr as i32).abs() <= 1, "改向瞬间仍在当前色");
+        a.set_now(1301); // 1101 + 200
+        let out = a.apply(&n);
+        assert_eq!(out.props["bg"], "#ff0000ff", "200ms 后到红色");
     }
 }
 
