@@ -324,7 +324,7 @@ fn win32_apply(window: &Window, enabled: bool) -> Result<(), String> {
         let h = window
             .window_handle()
             .map_err(|_| "raw window handle unavailable".to_string())?;
-        match h.window_handle() {
+        match h.as_raw() {
             RawWindowHandle::Win32(w) => w.hwnd.get() as isize,
             _ => return Err("not a Win32 window".to_string()),
         }
@@ -359,8 +359,11 @@ fn darwin_apply(window: &Window, enabled: bool) -> Result<(), String> {
         let h = window
             .window_handle()
             .map_err(|_| "raw window handle unavailable".to_string())?;
-        match h.window_handle() {
-            RawWindowHandle::AppKit(w) => w.ns_view.get() as usize,
+        // WindowHandle 上 window_handle() 因 trait 在作用域内解析为
+        // HasWindowHandle::window_handle()（返回 Result）；固有方法取
+        // RawWindowHandle 用 as_raw()。ns_view 是 NonNull<c_void>。
+        match h.as_raw() {
+            RawWindowHandle::AppKit(w) => w.ns_view.as_ptr() as usize,
             _ => return Err("not an AppKit window".to_string()),
         }
     };
@@ -368,7 +371,7 @@ fn darwin_apply(window: &Window, enabled: bool) -> Result<(), String> {
     use std::ffi::CString;
 
     unsafe extern "C" {
-        fn objc_msgSend(receiver: usize, selector: usize, ...);
+        fn objc_msgSend(receiver: usize, selector: usize, ...) -> usize;
         fn sel_registerName(name: *const i8) -> usize;
     }
 
@@ -380,11 +383,11 @@ fn darwin_apply(window: &Window, enabled: bool) -> Result<(), String> {
         if ns_win == 0 {
             return Err("NSWindow unavailable".to_string());
         }
-        // setIgnoresMouseEvents:（BOOL 参数，按 ARM64 objc ABI 以寄存器传 8 位值）。
+        // setIgnoresMouseEvents:（BOOL 经 C variadic 提升为 unsigned int）。
         objc_msgSend(
             ns_win,
             sel_registerName(CString::new("setIgnoresMouseEvents:").unwrap().as_ptr()),
-            enabled as u8,
+            enabled as std::ffi::c_uint,
         );
     }
     Ok(())
