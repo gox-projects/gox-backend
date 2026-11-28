@@ -186,21 +186,25 @@ func flexDefaultColumn(key, existing string) bool {
 	return strings.TrimSpace(existing) == ""
 }
 
-// expandBoxShadow 把单层 GX box-shadow token 展开成复刻 Skia/Rust 6 层矩形
+// expandBoxShadow 把单层 GX box-shadow token 展开成复刻 Skia/Rust 24 层矩形
 // 近似的 CSS 多层阴影，使 Web 端与桌面/Rust 端的阴影视觉一致。
 //
-// Skia paintShadow（Rust paint_shadow_tiny 同算法）：
+// Skia paintShadow（Rust build_gpu_frame 同算法）：
 //
 //	baseA = 颜色 alpha（<=0 时取 90）
-//	for i = 6..1:
-//	    t      = i / 6
+//	for i = 24..1:
+//	    t      = i / 24
 //	    expand = spread + blur * t
-//	    a      = baseA * (1 - t) / 6 * 1.8   （clamp 0..255）
+//	    a      = baseA * (1 - t) / 24 * 1.8   （clamp 0..255）
 //	    画圆角矩形：四周扩 expand，alpha=a，radius=原 radius+expand
+//
+// 层数必须足够多：6 层时层间距 blur/6（blur=56 时约 9px），每层硬边叠加会
+// 形成肉眼可见的同心"靶环"台阶；24 层把间距降到 ~2.3px，剖面平滑递减且贴近
+// 高斯参照。alpha 系数 1.8 保持不变即可维持与旧 6 层基本一致的总阴影深度。
 //
 // CSS box-shadow 的 spread 会同步把圆角半径增大 spread，故每层用
 // "ox oy 0px expand rgba(r,g,b,a/255)" 精确对应 Skia 的一层实心圆角矩形。
-// 输出顺序 i=1..6：CSS 第一个阴影绘制在最上层，对应 Skia 最后画的、最浓的内层。
+// 输出顺序 i=1..24：CSS 第一个阴影绘制在最上层，对应 Skia 最后画的、最浓的内层。
 //
 // 已是多层（含逗号）或解析失败时原样透传，避免二次展开。
 func expandBoxShadow(v string) string {
@@ -211,7 +215,7 @@ func expandBoxShadow(v string) string {
 	if baseA <= 0 {
 		baseA = 90
 	}
-	const layers = 6
+	const layers = 24
 	parts := make([]string, 0, layers)
 	for i := 1; i <= layers; i++ {
 		t := float64(i) / layers
@@ -311,7 +315,7 @@ func hexByte(s string) int {
 }
 
 // cssValue 把样式值规整为 CSS 值：纯数字的长度属性补 px；盒模型简写属性支持
-// 1~4 值逐边补单位；box-shadow 展开为 6 层以对齐 Skia/Rust；颜色/关键字原样。
+// 1~4 值逐边补单位；box-shadow 展开为 24 层以对齐 Skia/Rust；颜色/关键字原样。
 func cssValue(key, v string) string {
 	if v == "" {
 		return v

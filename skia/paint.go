@@ -539,7 +539,10 @@ func (p *painter) paintElement(n *gxscene.Node, box layoutBox) {
 
 // paintShadow 用多层半透明圆角矩形近似 box-shadow。
 // 从最大扩张（spread+blur）到 0 逐层绘制，alpha 沿高斯近似衰减，
-// 得到柔和阴影。与 Rust 端 paint_shapes 里的算法一致，保证跨平台观感相同。
+// 得到柔和阴影。与 Rust 端 build_gpu_frame 里的算法一致，保证跨平台观感相同。
+// 层数必须足够多：6 层时层间距 blur/6（blur=56 时约 9px），每层硬边叠加会
+// 形成肉眼可见的同心"靶环"台阶；24 层把间距降到 ~2.3px，剖面平滑递减且贴近
+// 高斯参照。alpha 系数 1.8 保持不变即可维持与旧 6 层基本一致的总阴影深度。
 func (p *painter) paintShadow(sh boxShadow, box layoutBox, radius float32) {
 	if sh.blur <= 0 && sh.spread <= 0 && sh.offsetX == 0 && sh.offsetY == 0 {
 		return
@@ -548,7 +551,7 @@ func (p *painter) paintShadow(sh boxShadow, box layoutBox, radius float32) {
 	if baseA <= 0 {
 		baseA = 90
 	}
-	const layers = 6
+	const layers = 24
 	for i := layers; i >= 1; i-- {
 		// 扩张量：外层大、内层小；最终层为 spread。
 		t := float32(i) / layers

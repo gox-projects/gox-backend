@@ -81,24 +81,25 @@ func TestCSSValueBoxShorthand(t *testing.T) {
 	}
 }
 
-// TestExpandBoxShadowMatchesSkia 验证 Web 端 6 层展开与 Skia/Rust 端
+// TestExpandBoxShadowMatchesSkia 验证 Web 端 24 层展开与 Skia/Rust 端
 // paintShadow 算法逐层一致：同一 token 两端算出相同的 expand 与 alpha 序列。
 func TestExpandBoxShadowMatchesSkia(t *testing.T) {
 	// "0 4px 16px 0 #00000040"：ox=0 oy=4 blur=16 spread=0 baseA=0x40=64
 	got := expandBoxShadow("0 4px 16px 0 #00000040")
 	layers := strings.Split(got, ", ")
-	if len(layers) != 6 {
-		t.Fatalf("应展开 6 层，got %d: %q", len(layers), got)
+	const L = 24
+	if len(layers) != L {
+		t.Fatalf("应展开 %d 层，got %d: %q", L, len(layers), got)
 	}
 
 	// 复刻 Skia paintShadow 公式，逐层比对。
 	const baseA = 64.0
 	const blur = 16.0
 	const spread = 0.0
-	for i := 1; i <= 6; i++ {
-		tt := float64(i) / 6
+	for i := 1; i <= L; i++ {
+		tt := float64(i) / L
 		wantExpand := spread + blur*tt
-		wantA := baseA * (1 - tt) / 6 * 1.8
+		wantA := baseA * (1 - tt) / L * 1.8
 		if wantA < 0 {
 			wantA = 0
 		} else if wantA > 255 {

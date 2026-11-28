@@ -24,8 +24,9 @@
 //!     GPU 后端另设 scissor 硬裁软边溢出，CPU 后端直接按交集绘制；
 //!   - 混合：全链路预乘 alpha、gamma 空间混合（对齐 tiny-skia/Skia raster）。
 //!
-//! 阴影不在后端实现：上层按旧 6 层近似算法分解成多条 Quad（与 Skia 端
-//! paintShadow 同算法），两个后端自然一致。
+//! 阴影不在后端实现：上层按 24 层近似算法分解成多条 Quad（与 Skia 端
+//! paintShadow 同算法），两个后端自然一致。层数需足够多（≥~20）才不会出现
+//! 同心台阶色带。
 
 #[cfg(feature = "gpu")]
 pub mod wgpu;

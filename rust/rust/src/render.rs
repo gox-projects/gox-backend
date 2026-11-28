@@ -399,15 +399,19 @@ impl Renderer {
             if rw <= 0.0 || rh <= 0.0 {
                 continue;
             }
-            // box-shadow：6 层半透明圆角矩形近似（与 Skia 端 paintShadow 同
+            // box-shadow：多层半透明圆角矩形近似（与 Skia 端 paintShadow 同
             // 算法）；几何不裁（旧实现仅做剔除），溢出由 scissor/交集裁剪兜底。
+            // 层数必须足够多：6 层时层间距 blur/6（blur=56 时约 9px），每层
+            // 硬边叠加会形成肉眼可见的同心"靶环"台阶，阴影不柔和。24 层把
+            // 间距降到 ~2.3px，剖面平滑递减且贴近高斯参照；alpha 系数 1.8
+            // 保持不变即可维持与旧 6 层基本一致的总阴影深度。
             if let Some(sh) = &s.shadow {
                 let base_a = if sh.color.3 > 0 {
                     sh.color.3 as f32
                 } else {
                     90.0
                 };
-                const LAYERS: i32 = 6;
+                const LAYERS: i32 = 24;
                 for i in (1..=LAYERS).rev() {
                     let t = i as f32 / LAYERS as f32;
                     let expand = sh.spread + sh.blur * t;

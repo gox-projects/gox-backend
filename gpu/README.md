@@ -42,8 +42,9 @@
   视觉语义一致。
 - **渐变**：CSS 角度语义（0°=向上），色标经 uniform 表（每帧 64 渐变 ×
   8 槽），instance 只带索引；与 Go `paintGradientBackgroundShader` 同算法。
-- **阴影不在后端**：上层按旧 6 层近似算法分解成多条 Quad（与 Skia 端
-  `paintShadow` 同算法），两个后端自然一致。
+- **阴影不在后端**：上层按 24 层近似算法分解成多条 Quad（与 Skia 端
+  `paintShadow` 同算法），两个后端自然一致。层数需足够多（≥~20）才不会出现
+  同心台阶色带。
 
 ## C ABI（gx_gpu.h）
 
