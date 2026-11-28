@@ -8,7 +8,7 @@ MODULES := rust/go skia web third_party/skia
 # Rust 静态库构建脚本（cgo 链接需要）。
 RUST_BUILD := rust/rust/build.sh
 
-.PHONY: build test test-rust clean all build-android-release
+.PHONY: build test test-rust clean all
 
 all: build
 
@@ -36,12 +36,6 @@ test:
 test-rust:
 	cargo test --manifest-path rust/rust/Cargo.toml
 	cargo test --manifest-path gpu/Cargo.toml
-
-## build-android-release: 一键构建 Android Release APK（详见 docs/android-release.md）
-##   默认 arm64；可用 make build-android-release ABI=x86_64 OUT=/tmp/x.apk
-ABI ?= arm64-v8a
-build-android-release:
-	bash scripts/android/build-release.sh --abi $(ABI) $(if $(OUT),--out $(OUT),) $(if $(RAW),--raw $(RAW),)
 
 ## clean: 清理 Rust 构建产物
 clean:
