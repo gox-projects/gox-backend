@@ -4,8 +4,8 @@ import (
 	"strings"
 
 	yoga "github.com/ahati/yoga-go-binding"
-	sk "github.com/robertpanvip/gox-skia/compat"
 	gxscene "github.com/robertpanvip/gox-core/runtime/scene"
+	sk "github.com/robertpanvip/gox-skia/compat"
 )
 
 // 本文件用 Facebook Yoga 3.x（github.com/ahati/yoga-go-binding，C++20
@@ -352,16 +352,54 @@ func computeLayout(root *gxscene.Node, availW, availH float32, measure fontMeasu
 		box := layoutBox{
 			X: ax, Y: ay, W: yn.LayoutWidth(), H: yn.LayoutHeight(),
 		}
-		// 继承祖先裁剪矩形。
+		// 继承祖先裁剪矩形。对 sticky 而言，这个矩形就是它要吸附的滚动视口。
 		if clip.HasClip {
 			box.ClipX, box.ClipY, box.ClipW, box.ClipH, box.HasClip =
 				clip.X, clip.Y, clip.W, clip.H, true
 		}
 
-		childOx, childOy := ax, ay
+		s := parseStyle(scene.Props)
+		// sticky 在 Yoga 里保持 relative（照常参与 flex 流、占据原始位置），
+		// 只在坐标回填阶段把滚动后的自然位置 clamp 到最近 overflow 祖先的
+		// 视口内：top/bottom/left/right（inset，NaN=auto 表示该边不吸附）。
+		// 这样既不改变 Yoga 的尺寸计算，也不影响兄弟节点布局。
+		if s.position == positionSticky && clip.HasClip {
+			loY, hiY := float32(-1e12), float32(1e12)
+			if !isNaN(s.inset[0]) { // top：吸附到视口顶部 + 偏移
+				loY = clip.Y + s.inset[0]
+			}
+			if !isNaN(s.inset[2]) { // bottom：吸附到视口底部 - 偏移 - 自身高
+				hiY = clip.Y + clip.H - s.inset[2] - box.H
+			}
+			if loY > hiY {
+				loY = hiY // 视口装不下时以 bottom 为准，避免来回跳
+			}
+			if box.Y < loY {
+				box.Y = loY
+			} else if box.Y > hiY {
+				box.Y = hiY
+			}
+			loX, hiX := float32(-1e12), float32(1e12)
+			if !isNaN(s.inset[3]) { // left
+				loX = clip.X + s.inset[3]
+			}
+			if !isNaN(s.inset[1]) { // right
+				hiX = clip.X + clip.W - s.inset[1] - box.W
+			}
+			if loX > hiX {
+				loX = hiX
+			}
+			if box.X < loX {
+				box.X = loX
+			} else if box.X > hiX {
+				box.X = hiX
+			}
+		}
+
+		// 子树原点基于（可能被 sticky 修正过的）box 坐标。
+		childOx, childOy := box.X, box.Y
 		childClip := box.clipRect()
 		if scene.Type == gxscene.NodeDiv {
-			s := parseStyle(scene.Props)
 			if s.overflow != overflowVisible {
 				// 容器自身被祖先裁剪（上面已继承）；它同时成为子树的新裁剪边界。
 				box.HasClip = true

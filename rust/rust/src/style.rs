@@ -9,6 +9,8 @@ use std::collections::HashMap;
 pub enum Position {
     Relative,
     Absolute,
+    /// 参与 flex 流，滚动时相对最近 overflow 祖先吸附到 inset 指定的边缘。
+    Sticky,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -490,8 +492,11 @@ pub fn parse_style(n: &SceneNode) -> Style {
         s.opacity = v.clamp(0.0, 1.0);
     }
     if let Some(v) = prop(n, "position") {
-        if v.trim().eq_ignore_ascii_case("absolute") {
+        let v = v.trim().to_ascii_lowercase();
+        if v == "absolute" {
             s.position = Position::Absolute;
+        } else if v == "sticky" {
+            s.position = Position::Sticky;
         }
     }
     for (i, k) in ["top", "right", "bottom", "left"].iter().enumerate() {

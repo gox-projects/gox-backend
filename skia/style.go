@@ -165,11 +165,13 @@ const (
 )
 
 // positionMode 是定位方式。relative 参与 flex 流（默认），absolute 脱离流并按 inset 定位。
+// sticky 参与 flex 流但在滚动时相对最近 overflow 祖先吸附到 inset 指定的边缘。
 type positionMode int
 
 const (
 	positionRelative positionMode = iota
 	positionAbsolute
+	positionSticky
 )
 
 // overflowMode 是内容溢出策略。
@@ -402,9 +404,14 @@ func parseStyle(props map[string]any) style {
 			s.border, s.hasBorder = c, true
 		}
 	}
-	// 定位
-	if v, ok := propString(props[propPosition]); ok && strings.EqualFold(strings.TrimSpace(v), "absolute") {
-		s.position = positionAbsolute
+	// 定位：sticky 参与 flex 流（Yoga 保持 relative），吸附在坐标 walk 阶段处理。
+	if v, ok := propString(props[propPosition]); ok {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "absolute":
+			s.position = positionAbsolute
+		case "sticky":
+			s.position = positionSticky
+		}
 	}
 	s.inset = edges{
 		propNumAuto(props[propTop]), propNumAuto(props[propRight]),

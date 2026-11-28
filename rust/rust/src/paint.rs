@@ -621,6 +621,48 @@ pub(crate) fn child_clip_of(
     }
 }
 
+/// sticky 坐标修正：把滚动后的自然位置 (x,y) clamp 到最近 overflow 祖先的
+/// 视口（parent_clip）内，按 inset 指定的边吸附。inset 为 NaN(auto) 的边不吸附。
+/// 与 Skia 端 layout.go 的 sticky 逻辑严格对齐。
+///
+/// parent_clip 是继承来的裁剪矩形，恰好就是 sticky 要吸附的滚动视口；无
+/// overflow 祖先时退化为 relative（不吸附）。调用方必须让 emit 缓存签名
+/// 也走本函数，否则签名不含 sticky 偏移、命中旧槽会画在未吸附的位置。
+fn sticky_adjust(
+    st: &crate::style::Style,
+    parent_clip: ClipRect,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) -> (f32, f32) {
+    if st.position != crate::style::Position::Sticky {
+        return (x, y);
+    }
+    let (cx, cy, cw, ch) = match parent_clip {
+        Some(c) => c,
+        None => return (x, y),
+    };
+    let inset = st.inset; // [top, right, bottom, left]，NaN = auto
+    let mut nx = x;
+    let mut ny = y;
+    // 垂直：top 吸附到视口顶 + 偏移；bottom 吸附到视口底 - 偏移 - 自身高。
+    let mut lo_y = if inset[0].is_nan() { f32::NEG_INFINITY } else { cy + inset[0] };
+    let mut hi_y = if inset[2].is_nan() { f32::INFINITY } else { cy + ch - inset[2] - h };
+    if lo_y > hi_y {
+        lo_y = hi_y; // 视口装不下时以 bottom 为准，避免来回跳
+    }
+    ny = ny.max(lo_y).min(hi_y);
+    // 水平：left 吸附到视口左 + 偏移；right 吸附到视口右 - 偏移 - 自身宽。
+    let mut lo_x = if inset[3].is_nan() { f32::NEG_INFINITY } else { cx + inset[3] };
+    let mut hi_x = if inset[1].is_nan() { f32::INFINITY } else { cx + cw - inset[1] - w };
+    if lo_x > hi_x {
+        lo_x = hi_x;
+    }
+    nx = nx.max(lo_x).min(hi_x);
+    (nx, ny)
+}
+
 #[derive(Clone)]
 pub(crate) struct DisplayList {
     pub(crate) shapes: Vec<ShapeDraw>,
@@ -1094,17 +1136,27 @@ impl DisplayList {
                 // parse_style 的字符串解析——默认语义（Visible/0.0）与之一致。
                 let needs_style = node.props.contains_key("overflow")
                     || node.props.contains_key("scroll-left")
-                    || node.props.contains_key("scroll-top");
-                let (st_cl, st_sl) = if needs_style {
+                    || node.props.contains_key("scroll-top")
+                    || node.props.contains_key("position");
+                let (st, st_cl, st_sl) = if needs_style {
                     let st = crate::style::parse_style(node);
-                    (st.overflow, (st.scroll_left, st.scroll_top))
+                    let cl = st.overflow;
+                    let sl = (st.scroll_left, st.scroll_top);
+                    (st, cl, sl)
                 } else {
-                    (crate::style::Overflow::Visible, (0.0, 0.0))
+                    (
+                        crate::style::Style::default(),
+                        crate::style::Overflow::Visible,
+                        (0.0, 0.0),
+                    )
                 };
-                let x = ox + lay.location.x;
-                let y = oy + lay.location.y;
+                let x0 = ox + lay.location.x;
+                let y0 = oy + lay.location.y;
                 let w = lay.size.width;
                 let h = lay.size.height;
+                // 与 emit 同口径应用 sticky 吸附，否则签名不含 sticky 偏移、
+                // 命中旧槽会画在未吸附位置（滚动时表头不跟随）。
+                let (x, y) = sticky_adjust(&st, parent_clip, x0, y0, w, h);
                 let my_clip =
                     if node.typ == NodeType::Div && st_cl != crate::style::Overflow::Visible {
                         clip_intersect(parent_clip, Some((x, y, w, h)))
@@ -1352,7 +1404,7 @@ impl DisplayList {
             let my_tinh = TextInherit::derive(&node.props, size, tinh);
             let lay = ctx.taffy.layout(tnode).expect("taffy layout");
             // 浮层根用第二遍算出的目标坐标；其余节点沿用 Taffy 相对坐标累加。
-            let (x, y) = overrides
+            let (rx, ry) = overrides
                 .get(&ov_key(node))
                 .copied()
                 .unwrap_or((ox + lay.location.x, oy + lay.location.y));
@@ -1362,6 +1414,9 @@ impl DisplayList {
                 w = avail_w;
                 h = avail_h; // 遮罩覆盖整个画布
             }
+            // sticky：把滚动后的自然位置 clamp 到最近 overflow 祖先视口。
+            let st = crate::style::parse_style(node);
+            let (x, y) = sticky_adjust(&st, parent_clip, rx, ry, w, h);
 
             // 回流实测尺寸：按稳定 node.id 上报最终布局宽高。虚拟列表等组件
             // 按 item 根节点 ID 订阅，据此修正 offsets 与锚定（对齐 virtua）。
@@ -1370,7 +1425,6 @@ impl DisplayList {
             }
 
             // overflow 容器：本节点矩形成为子树的新裁剪边界；子树坐标减 scroll 偏移。
-            let st = crate::style::parse_style(node);
             let my_clip = child_clip_of(node, parent_clip, x, y, w, h);
             let child_ox = x - st.scroll_left;
             let child_oy = y - st.scroll_top;
@@ -2479,5 +2533,149 @@ mod selection_tests {
             text_sig(&mono),
             "字体族变化应触发重新 shape"
         );
+    }
+}
+
+#[cfg(test)]
+mod sticky_tests {
+    use super::*;
+    use crate::binprotocol::NodeType;
+    use crate::style::{Overflow, Position, Style};
+
+    fn sticky_style(top: f32) -> Style {
+        let mut st = Style::default();
+        st.position = Position::Sticky;
+        st.inset = [top, f32::NAN, f32::NAN, f32::NAN];
+        st
+    }
+
+    #[test]
+    fn sticky_top_clamps_to_viewport() {
+        // 视口 (0,0,100,60)，sticky top=10，自然 y=-20 → 吸附到 10。
+        let st = sticky_style(10.0);
+        let (x, y) = sticky_adjust(&st, Some((0.0, 0.0, 100.0, 60.0)), 5.0, -20.0, 50.0, 20.0);
+        assert!((x - 5.0).abs() < 0.01, "水平未声明 inset 不应改动 x");
+        assert!((y - 10.0).abs() < 0.01, "应吸附到视口顶 + 10, y={}", y);
+    }
+
+    #[test]
+    fn sticky_no_scroll_keeps_natural() {
+        // 自然 y=40 在吸附线 10 之下 → 保持原位（未滚到阈值）。
+        let st = sticky_style(10.0);
+        let (_, y) = sticky_adjust(&st, Some((0.0, 0.0, 100.0, 60.0)), 0.0, 40.0, 50.0, 20.0);
+        assert!((y - 40.0).abs() < 0.01, "未到阈值应保持自然位置, y={}", y);
+    }
+
+    #[test]
+    fn sticky_without_overflow_viewport_is_noop() {
+        // 无 overflow 祖先（parent_clip=None）→ 退化为 relative，不吸附。
+        let st = sticky_style(10.0);
+        let (x, y) = sticky_adjust(&st, None, 7.0, -99.0, 50.0, 20.0);
+        assert!((x - 7.0).abs() < 0.01 && (y + 99.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn sticky_bottom_clamps() {
+        // bottom=5，视口高 60，自身高 20 → 吸附到 60-5-20=35。
+        let mut st = Style::default();
+        st.position = Position::Sticky;
+        st.inset = [f32::NAN, f32::NAN, 5.0, f32::NAN];
+        let (_, y) = sticky_adjust(&st, Some((0.0, 0.0, 100.0, 60.0)), 0.0, 100.0, 50.0, 20.0);
+        assert!((y - 35.0).abs() < 0.01, "应吸附到视口底 - 5 - 20, y={}", y);
+    }
+
+    #[test]
+    fn parse_position_sticky() {
+        let node = crate::scene::SceneNode {
+            typ: NodeType::Div,
+            kind: "div".into(),
+            id: String::new(),
+            nid: 1,
+            text: String::new(),
+            props: [("position".to_string(), " sticky ".to_string())]
+                .into_iter()
+                .collect(),
+            events: vec![],
+            children: vec![],
+        };
+        assert_eq!(crate::style::parse_style(&node).position, Position::Sticky);
+    }
+
+    /// 端到端：overflow 容器 scroll-top=60，含 4 个高 40 子块；第 2 个 sticky
+    /// top=10、bg=#ff0000。滚动后其绘制形状 y 应≈10（视口顶 + top）。
+    fn sticky_scene(scroll_top: f32) -> crate::scene::SceneNode {
+        let mut kids = Vec::new();
+        for i in 0..4 {
+            let mut props: std::collections::HashMap<String, String> = [
+                ("height".to_string(), "40".to_string()),
+                ("bg".to_string(), "#00ff00".to_string()),
+            ]
+            .into_iter()
+            .collect();
+            if i == 1 {
+                props.insert("position".into(), "sticky".into());
+                props.insert("top".into(), "10".into());
+                props.insert("bg".into(), "#ff0000".into());
+            }
+            kids.push(crate::scene::SceneNode {
+                typ: NodeType::Div,
+                kind: "div".into(),
+                id: format!("item{}", i),
+                nid: 2000 + i as u64,
+                text: String::new(),
+                props,
+                events: vec![],
+                children: vec![],
+            });
+        }
+        let mut props: std::collections::HashMap<String, String> = [
+            ("width".to_string(), "100".to_string()),
+            ("height".to_string(), "60".to_string()),
+            ("overflow".to_string(), "scroll".to_string()),
+            ("scroll-top".to_string(), format!("{}", scroll_top)),
+        ]
+        .into_iter()
+        .collect();
+        crate::scene::SceneNode {
+            typ: NodeType::Div,
+            kind: "div".into(),
+            id: "vp".into(),
+            text: String::new(),
+            nid: 1999,
+            props,
+            events: vec![],
+            children: kids,
+        }
+    }
+
+    fn sticky_shape_y(scroll_top: f32) -> f32 {
+        let dl = DisplayList::from_scene(
+            &sticky_scene(scroll_top),
+            800.0,
+            600.0,
+            &mut crate::layout::LayoutCache::new(),
+        );
+        // 找 bg = #ff0000 (255,0,0) 的 shape
+        let shapes: Vec<&ShapeDraw> = dl
+            .shapes
+            .iter()
+            .filter(|s| s.bg_present && s.bg == (255, 0, 0))
+            .collect();
+        assert_eq!(shapes.len(), 1, "应只有一个红色 sticky shape");
+        shapes[0].y
+    }
+
+    #[test]
+    fn from_scene_sticky_sticks_when_scrolled() {
+        // scrollTop=60：第 2 块自然 y=40-60=-20 → 吸附到视口顶 + top = 10。
+        let y = sticky_shape_y(60.0);
+        assert!((y - 10.0).abs() < 1.0, "滚动后 sticky 应吸附到 y≈10, got {}", y);
+    }
+
+    #[test]
+    fn from_scene_sticky_natural_when_not_scrolled() {
+        // scrollTop=0：自然 y=40，吸附线 10 → 保持 40。
+        let y = sticky_shape_y(0.0);
+        assert!((y - 40.0).abs() < 1.0, "未滚动 sticky 应保持 y≈40, got {}", y);
     }
 }
