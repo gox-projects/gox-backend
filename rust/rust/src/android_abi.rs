@@ -14,15 +14,32 @@
 //! surface 重建时必须调 gx_android_set_window 换新指针（或销毁重建）。
 
 use crate::android_surface::AndroidSurface;
-use crate::render::Renderer;
-use std::ffi::{c_int, c_uchar, c_void};
+use crate::render::{gpu_probe, Renderer};
+use std::ffi::{c_char, c_int, c_uchar, c_void};
 use std::sync::{Arc, Mutex};
+
+/// 诊断探针结果缓存：gx_android_diag 每次调用重新探测并覆盖，返回指针在
+/// 下次调用前有效。用 Mutex 保证跨线程调用安全（Go 侧从 UI 按钮触发）。
+static DIAG_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 /// Go 宿主持有的渲染句柄：surface provider + 渲染内核成对存放。
 /// Renderer 放 Option 以支持"surface 重建期短暂无渲染器"（lifecycle 窗口）。
 pub struct AndroidHost {
     surface: Arc<AndroidSurface>,
     renderer: Mutex<Option<Renderer>>,
+}
+
+/// 诊断探针：主动枚举 wgpu 后端/适配器/设备，返回可读诊断串（UTF-8，非空结尾）。
+/// 每次调用重新探测并覆盖 DIAG_BUF；返回的指针在下次调用前有效。
+/// 供 Go 侧"诊断按钮"调用，定位 V2 初始化失败、走 GLES 回退的确切原因。
+#[no_mangle]
+pub extern "C" fn gx_android_diag() -> *const c_char {
+    let text = gpu_probe();
+    let mut buf = DIAG_BUF.lock().expect("diag lock");
+    buf.clear();
+    buf.extend_from_slice(text.as_bytes());
+    buf.push(0); // NUL 结尾，C.GoString 安全
+    buf.as_ptr() as *const c_char
 }
 
 /// 构造渲染宿主：注入 ANativeWindow* 并初始化 wgpu（Vulkan/GLES 自动选后端）。

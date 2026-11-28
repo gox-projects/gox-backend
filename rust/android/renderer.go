@@ -23,6 +23,7 @@ extern int         gx_android_resize(void* host, int width, int height, float dp
 extern int         gx_android_set_window(void* host, void* native_window, int width, int height);
 extern void        gx_android_destroy(void* host);
 extern const char* gx_android_version();
+extern const char* gx_android_diag();
 
 // JNI 反射链取 ANativeWindow*（定义在 native_window_jni.c）：失败返回 NULL。
 void* gx_go_native_window_from_activity(JNIEnv* env, jobject activity);
@@ -53,6 +54,16 @@ func Version() string {
 	p := C.gx_android_version()
 	if p == nil {
 		return ""
+	}
+	return C.GoString(p)
+}
+
+// Diag 主动探测 GPU 能力，返回可读诊断串（为何走 GLES 回退的确切原因）。
+// 供 UI"诊断按钮"调用：在真机上直接弹出，无需 logcat。
+func Diag() string {
+	p := C.gx_android_diag()
+	if p == nil {
+		return "gx_android_diag 返回空（静态库缺失或符号不符）"
 	}
 	return C.GoString(p)
 }

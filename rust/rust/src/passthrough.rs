@@ -213,9 +213,15 @@ pub fn set_input_focus(window: &Window) -> Result<(), String> {
     x11::set_input_focus(dpy, xwin)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(target_os = "android")))]
 pub fn set_input_focus(_window: &Window) -> Result<(), String> {
     // macOS/Windows：winit focus_window 走平台原生 API 有效，无 WM 问题不存在。
+    Err("direct input focus only needed on X11".to_string())
+}
+
+#[cfg(target_os = "android")]
+pub fn set_input_focus() -> Result<(), String> {
+    // Android：无 X11 窗口管理器概念，NativeActivity 焦点由系统管理，无需处理。
     Err("direct input focus only needed on X11".to_string())
 }
 

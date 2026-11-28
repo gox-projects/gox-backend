@@ -434,6 +434,22 @@ func (w *Window) LogicalSize() (int, int) {
 	return w.logicalSizeLocked()
 }
 
+// FullDiag 返回完整真机诊断文本：当前渲染路径/DPR/尺寸 + wgpu GPU 探测详情。
+// 供 UI"诊断按钮"弹出显示，替代 logcat 抓日志。
+func (w *Window) FullDiag() string {
+	pw, ph := w.PhysSize()
+	lw, lh := w.LogicalSize()
+	var b strings.Builder
+	b.WriteString("=== 渲染状态 ===\n")
+	b.WriteString(fmt.Sprintf("路径: %s\n", w.RenderPath()))
+	b.WriteString(fmt.Sprintf("DPR: %.3f\n", w.Dpr()))
+	b.WriteString(fmt.Sprintf("物理: %dx%d  逻辑: %dx%d\n", pw, ph, lw, lh))
+	b.WriteString(fmt.Sprintf("C ABI 版本: %s\n", Version()))
+	b.WriteString("\n")
+	b.WriteString(Diag())
+	return b.String()
+}
+
 func (w *Window) logicalSizeLocked() (int, int) {
 	if w.physW <= 0 || w.dpr <= 0 {
 		return 1080, 720

@@ -1318,6 +1318,101 @@ pub fn bench_frame(buf: &[u8], width: f32, height: f32, iters: u32) -> Option<u6
     Some(ns)
 }
 
+// ---------- GPU 能力诊断（Android 真机排查 V2 初始化失败用） ----------
+
+/// gpu_probe 主动枚举 wgpu 后端/适配器/设备，把每一步结果拼成可读字符串。
+/// 与 Renderer::new 解耦：即使初始化 panic，本函数仍能在 Go 侧"诊断按钮"里
+/// 被调用，返回为何走 GLES 回退的确切原因。全程 catch_unwind，绝不 panic 穿 FFI。
+pub fn gpu_probe() -> String {
+    fn step(out: &mut String, label: &str, f: impl FnOnce() -> String) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(s) => out.push_str(&format!("[OK] {}: {}\n", label, s)),
+            Err(_) => out.push_str(&format!("[PANIC] {}\n", label)),
+        }
+    }
+    let mut out = String::new();
+    out.push_str("=== wgpu GPU probe ===\n");
+    out.push_str(&format!("backends compiled: {:?}\n", wgpu::Backends::all()));
+
+    // 1) 建 instance
+    let instance = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Instance::new(&InstanceDescriptor::default())
+    })) {
+        Ok(i) => i,
+        Err(_) => {
+            out.push_str("[PANIC] Instance::new\n");
+            return out;
+        }
+    };
+    out.push_str("[OK] Instance::new\n");
+
+    // 2) 枚举所有 adapter（关键：看 Vulkan/GLES 各有没有设备）
+    step(&mut out, "enumerate_adapters", || {
+        let list = instance.enumerate_adapters(wgpu::Backends::all());
+        if list.is_empty() {
+            return "0 个适配器（wgpu 在本机拿不到任何 GPU 设备）".to_string();
+        }
+        let mut s = format!("{} 个:\n", list.len());
+        for (i, a) in list.iter().enumerate() {
+            let info = a.get_info();
+            s.push_str(&format!(
+                "  #{} name={} backend={:?} device={:?}\n",
+                i, info.name, info.backend, info.device_type
+            ));
+        }
+        s
+    });
+
+    // 3) 默认 request_adapter（Renderer::new 走的就是这条）
+    let adapter = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pollster::block_on(instance.request_adapter(&RequestAdapterOptions::default()))
+    })) {
+        Ok(Ok(a)) => {
+            let info = a.get_info();
+            out.push_str(&format!(
+                "[OK] request_adapter(default): {} {:?}\n",
+                info.name, info.backend
+            ));
+            Some(a)
+        }
+        Ok(Err(e)) => {
+            out.push_str(&format!("[FAIL] request_adapter(default): {} —— 这就是 Renderer::new 里 expect 崩溃、回退 GLES 的直接原因\n", e));
+            None
+        }
+        Err(_) => {
+            out.push_str("[PANIC] request_adapter(default)\n");
+            None
+        }
+    };
+
+    // 4) 尝试 request_device（adapter 有但 device 也可能失败）
+    if let Some(a) = adapter {
+        step(&mut out, "request_device", || {
+            match pollster::block_on(a.request_device(&DeviceDescriptor::default())) {
+                Ok(_) => "成功拿到 device+queue".to_string(),
+                Err(e) => format!("失败: {}", e),
+            }
+        });
+    }
+
+    // 5) 低能耗/软件回退适配器再试一次（force_fallback_adapter）
+    step(&mut out, "request_adapter(force_fallback)", || {
+        match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+            force_fallback_adapter: true,
+            ..Default::default()
+        })) {
+            Ok(a) => {
+                let info = a.get_info();
+                format!("拿到 {} {:?}", info.name, info.backend)
+            }
+            Err(e) => format!("没有 fallback 适配器: {}", e),
+        }
+    });
+
+    out.push_str("=== end probe ===\n");
+    out
+}
+
 /// 缓存命中路径基准：同一棵树重复 from_scene，验证布局复用（签名命中 →
 /// 跳过 build+compute_layout，只跑 emit）的实际收益。与 bench_frame 的
 /// 比值即「绘制属性变化帧相对全量帧的加速比」。
