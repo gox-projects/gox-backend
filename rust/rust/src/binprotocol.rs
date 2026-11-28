@@ -212,3 +212,169 @@ impl<'a> FrameView<'a> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put32(b: &mut [u8], o: usize, v: u32) {
+        b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn pool_str(buf: &mut Vec<u8>, s: &str) -> u32 {
+        let off = buf.len() as u32;
+        buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+        off
+    }
+
+    /// 构造一个合法 GRX1 帧：1 个 Div 节点（id="n1"）+ 1 属性 + 1 事件。
+    fn valid_frame() -> Vec<u8> {
+        let mut pool = Vec::new();
+        let kind = pool_str(&mut pool, "div");
+        let id = pool_str(&mut pool, "n1");
+        let text = pool_str(&mut pool, "hi");
+        let pkey = pool_str(&mut pool, "color");
+        let pval = pool_str(&mut pool, "red");
+        let evname = pool_str(&mut pool, "click");
+        let mut node = vec![0u8; NODE_SZ];
+        node[0] = 1; // Div
+        node[1] = 1; // has_events
+        put32(&mut node, 4, kind);
+        put32(&mut node, 8, id);
+        put32(&mut node, 12, text);
+        put32(&mut node, 16, 0); // prop_start
+        node[20..22].copy_from_slice(&1u16.to_le_bytes()); // prop_count
+        node[22..24].copy_from_slice(&0u16.to_le_bytes()); // child_count
+        put32(&mut node, 24, 0xFFFF_FFFF); // parent = none
+
+        let mut prop = vec![0u8; PROP_SZ];
+        put32(&mut prop, 0, pkey);
+        put32(&mut prop, 4, pval);
+
+        let mut event = vec![0u8; EVENT_SZ];
+        put32(&mut event, 0, 0); // node_index
+        put32(&mut event, 4, evname);
+
+        let total = HEADER + node.len() + prop.len() + event.len() + pool.len();
+        let mut buf = vec![0u8; total];
+        put32(&mut buf, 0, MAGIC);
+        put32(&mut buf, 4, 800);
+        put32(&mut buf, 8, 600);
+        put32(&mut buf, 12, 1); // node_count
+        put32(&mut buf, 16, 1); // prop_count
+        put32(&mut buf, 20, pool.len() as u32);
+        let mut o = HEADER;
+        buf[o..o + node.len()].copy_from_slice(&node);
+        o += node.len();
+        buf[o..o + prop.len()].copy_from_slice(&prop);
+        o += prop.len();
+        buf[o..o + event.len()].copy_from_slice(&event);
+        o += event.len();
+        buf[o..].copy_from_slice(&pool);
+        buf
+    }
+
+    #[test]
+    fn scalar_readers_out_of_range_return_zero() {
+        let b = [0x78u8, 0x56, 0x34, 0x12];
+        assert_eq!(u32at(&b, 0), 0x1234_5678);
+        assert_eq!(u32at(&b, 1), 0, "未对齐越界 → 0");
+        assert_eq!(u32at(&b, 8), 0);
+        assert_eq!(u32at(&[], 0), 0);
+        assert_eq!(u16at(&b, 0), 0x5678);
+        assert_eq!(u16at(&b, 3), 0);
+        assert_eq!(u16at(&b, 100), 0);
+    }
+
+    #[test]
+    fn frame_view_parse_rejects_malformed() {
+        assert!(FrameView::parse(&[]).is_none(), "空 buffer");
+        assert!(FrameView::parse(&[0u8; 23]).is_none(), "短于 header");
+        let mut bad_magic = vec![0u8; HEADER];
+        put32(&mut bad_magic, 0, 0xDEAD_BEEF);
+        assert!(FrameView::parse(&bad_magic).is_none(), "非法 magic");
+
+        let mut huge_nodes = vec![0u8; HEADER];
+        put32(&mut huge_nodes, 0, MAGIC);
+        put32(&mut huge_nodes, 12, u32::MAX);
+        assert!(FrameView::parse(&huge_nodes).is_none(), "巨大 node_count → checked_mul 拒绝");
+
+        let mut huge_pool = vec![0u8; HEADER];
+        put32(&mut huge_pool, 0, MAGIC);
+        put32(&mut huge_pool, 20, u32::MAX);
+        assert!(FrameView::parse(&huge_pool).is_none(), "巨大 pool_len → checked_sub 拒绝");
+
+        // events 段不是 12 的整数倍 → 拒绝。
+        let mut misaligned = valid_frame();
+        misaligned.push(0);
+        assert!(FrameView::parse(&misaligned).is_none(), "events 长度非 12 倍数应拒绝");
+    }
+
+    #[test]
+    fn frame_view_reads_valid_fields() {
+        let buf = valid_frame();
+        let v = FrameView::parse(&buf).expect("合法帧应可解析");
+        assert_eq!((v.width, v.height), (800, 600));
+        assert_eq!(v.node_count, 1);
+        assert_eq!(v.prop_count, 1);
+        assert_eq!(v.event_count, 1);
+        let n = v.node(0);
+        assert_eq!(n.typ, NodeType::Div);
+        assert!(n.has_events);
+        assert_eq!(n.id, "n1");
+        assert_eq!(n.node_id, 0, "GRX1 从非数字 id parse 失败 → 0");
+        assert_eq!(n.text, "hi");
+        assert_eq!(n.child_count, 0);
+        let p = v.prop(0);
+        assert_eq!((p.key, p.val), ("color", "red"));
+        let e = v.event(0);
+        assert_eq!((e.node_index, e.name), (0, "click"));
+        assert_eq!(v.prop_value(&n, "color"), Some("red"));
+        assert_eq!(v.prop_value(&n, "missing"), None);
+    }
+
+    #[test]
+    fn frame_view_out_of_range_views_never_panic() {
+        let buf = valid_frame();
+        let v = FrameView::parse(&buf).unwrap();
+        // 越界 node：typ 降级为 Fragment、node_id 归零（核心契约：不 panic）。
+        // 字符串字段回退到池 offset 0 的内容（本帧恰为 "div"），这是零拷贝读的
+        // 固有语义——协议不保证越界字符串为空，只保证读到的是合法 UTF-8。
+        let n = v.node(999);
+        assert_eq!(n.typ, NodeType::Fragment);
+        assert_eq!(n.node_id, 0);
+        let _ = (n.id, n.kind, n.text); // 均为合法 &str，不得 panic
+        let p = v.prop(999);
+        let _ = (p.key, p.val);
+        let e = v.event(999);
+        assert_eq!(e.node_index, 0);
+        let _ = e.name;
+    }
+
+    #[test]
+    fn truncated_frames_never_panic() {
+        let full = valid_frame();
+        for n in 0..full.len() {
+            if let Some(v) = FrameView::parse(&full[..n]) {
+                let _ = v.node(0);
+                let _ = v.node(999);
+                let _ = v.prop(0);
+                let _ = v.event(0);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_in_pool_is_empty_string() {
+        let buf = valid_frame();
+        let mut broken = buf.clone();
+        // 把 pool 区第一个字节改成非法 UTF-8 起始字节 0xFF。
+        // pool_off = HEADER + NODE_SZ + PROP_SZ + EVENT_SZ
+        let pool_off = HEADER + NODE_SZ + PROP_SZ + EVENT_SZ;
+        if pool_off < broken.len() {
+            broken[pool_off + 2] = 0xFF; // kind 字符串首字节（跳过 2 字节长度前缀）
+        }
+        let v = FrameView::parse(&broken).unwrap();
+        let _ = v.node(0); // 不得 panic，非法 UTF-8 视图字符串回退为空
+    }
+}

@@ -828,4 +828,123 @@ mod tests {
         // key 为空串插入 HashMap 验证通道畅通即可。
         assert_eq!(root.children[2].text, "Z");
     }
+
+    // ---------- 畸形帧防御：解析在事件泵线程，越界绝不 panic ----------
+
+    #[test]
+    fn scalar_readers_out_of_range_return_zero() {
+        let b = [0x78u8, 0x56, 0x34, 0x12];
+        assert_eq!(u32at(&b, 0), 0x1234_5678, "对齐读取应正确");
+        assert_eq!(u32at(&b, 1), 0, "未对齐越界应返回 0");
+        assert_eq!(u32at(&b, 8), 0, "完全越界应返回 0");
+        assert_eq!(u32at(&[], 0), 0, "空 buffer 应返回 0");
+        assert_eq!(u16at(&b, 0), 0x5678);
+        assert_eq!(u16at(&b, 3), 0, "尾部 1 字节不足应返回 0");
+        assert_eq!(u16at(&b, 100), 0);
+        let b8 = [1u8, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(u64at(&b8, 0), 1);
+        assert_eq!(u64at(&b8, 4), 0, "8 字节读到尾部应返回 0");
+        assert_eq!(u64at(&b8, 0), 1, "重复读取不应改变 buffer");
+    }
+
+    #[test]
+    fn delta_view_parse_rejects_malformed_buffers() {
+        assert!(DeltaView::parse(&[]).is_none(), "空 buffer 应拒绝");
+        assert!(DeltaView::parse(&[0u8; 15]).is_none(), "短于 header 应拒绝");
+        let mut bad_magic = vec![0u8; 16];
+        put32(&mut bad_magic, 0, 0xDEAD_BEEF);
+        assert!(DeltaView::parse(&bad_magic).is_none(), "非法 magic 应拒绝");
+
+        // count 巨大 → checked_mul 溢出或 pool_off 越界 → None，绝不 panic。
+        let mut huge_count = vec![0u8; 16];
+        put32(&mut huge_count, 0, DELTA_MAGIC);
+        put32(&mut huge_count, 8, u32::MAX);
+        assert!(DeltaView::parse(&huge_count).is_none(), "GRX2 巨大 count 应拒绝");
+        let mut huge_count3 = vec![0u8; 16];
+        put32(&mut huge_count3, 0, DELTA_MAGIC_V3);
+        put32(&mut huge_count3, 8, u32::MAX);
+        assert!(DeltaView::parse(&huge_count3).is_none(), "GRX3 巨大 count 应拒绝");
+
+        // pool_len 越界 → blob_off > buf.len() → None。
+        let mut huge_pool = vec![0u8; 16];
+        put32(&mut huge_pool, 0, DELTA_MAGIC);
+        put32(&mut huge_pool, 12, u32::MAX);
+        assert!(DeltaView::parse(&huge_pool).is_none(), "巨大 pool_len 应拒绝");
+    }
+
+    #[test]
+    fn delta_pool_str_out_of_range_is_empty() {
+        let g2 = make_grx2(&[], &[]);
+        let v = DeltaView::parse(&g2).unwrap();
+        assert_eq!(v.pool_str(u32::MAX), "", "越界 offset 应返回空串");
+        assert_eq!(v.pool_str(1000), "");
+        assert_eq!(v.pool_str(0), ""); // 空池首槽
+    }
+
+    #[test]
+    fn delta_action_out_of_range_never_panics() {
+        let g2 = make_grx2(&[(ACT_SET_TEXT, "10", "", "", "x")], &[]);
+        let v = DeltaView::parse(&g2).unwrap();
+        let a0 = v.action(0).expect("第 0 条应有效");
+        assert_eq!(a0.kind, ACT_SET_TEXT);
+        assert_eq!(a0.node_id, 10);
+        // 紧邻的 index 可能落入 pool/blob 区：零拷贝解析对越界字段一律安全降级，
+        // 读到垃圾数据但绝不 unwind——这正是事件泵线程所需的"坏帧不 panic"契约。
+        for i in 1..8 {
+            let _ = v.action(i);
+        }
+        // 远超 buffer 的 index：kind 槽无字节 → None。
+        assert!(v.action(10_000).is_none(), "远超 buffer 的 index 应返回 None");
+    }
+
+    #[test]
+    fn delta_apply_with_corrupt_pool_offset_does_not_panic() {
+        let mut root = base_tree();
+        let mut g2 = make_grx2(&[(ACT_SET_TEXT, "10", "", "", "hacked")], &[]);
+        // 篡改第 0 条 action 的 node_id 池 offset 为越界值：pool_str 返回空串，
+        // parse::<u64>()=0 → 找不到目标节点 → 动作被安全丢弃，绝不 panic。
+        put32(&mut g2, 16 + 4, u32::MAX);
+        let v = DeltaView::parse(&g2).unwrap();
+        assert_eq!(v.apply(&mut root), 0, "坏 offset 的动作应被跳过");
+        assert_eq!(ids(&root), ["a", "b", "c"], "镜像树不应被破坏");
+    }
+
+    #[test]
+    fn grx3_delta_corrupt_blob_offset_does_not_panic() {
+        let mut root = base_tree();
+        let mut g3 = make_grx3_delta(&[(ACT_INSERT_BEFORE, 10, 0, 12, 0, 4, "")], &[]);
+        // blob_off/blob_len 指向不存在的 blob 区：subtree() 应返回 None，动作丢弃。
+        put32(&mut g3, 16 + 36, u32::MAX);
+        put32(&mut g3, 16 + 44, 100);
+        let v = DeltaView::parse(&g3).unwrap();
+        let _ = v.apply(&mut root);
+        assert_eq!(ids(&root), ["a", "b", "c"], "坏 blob 不应破坏镜像树");
+    }
+
+    #[test]
+    fn truncated_delta_frames_never_panic() {
+        let full = make_grx2(&[(ACT_SET_TEXT, "10", "", "", "hello")], &[]);
+        // 逐一截断到各种长度，parse 可能返回 None，但任何长度都不能 panic。
+        for n in 0..full.len() {
+            let slice = &full[..n];
+            if let Some(v) = DeltaView::parse(slice) {
+                let mut root = base_tree();
+                let _ = v.apply(&mut root);
+            }
+        }
+    }
+
+    #[test]
+    fn delta_magics_are_distinct_from_all_frame_magics() {
+        // 全量帧 magic：GRX1=0x31585247、GRX3=0x33585247。
+        // delta magic 若与任一全量帧相同，FrameView::parse 先试会把 delta
+        // 误判成全量快照 → 字段错位 → pool_str 越界 → panic（真实历史 bug）。
+        let frame_magics = [0x3158_5247u32, 0x3358_5247];
+        for &dm in &[DELTA_MAGIC, DELTA_MAGIC_V3] {
+            for &fm in &frame_magics {
+                assert_ne!(dm, fm, "delta magic 0x{dm:08X} 不得等于全量帧 magic 0x{fm:08X}");
+            }
+        }
+        assert_ne!(DELTA_MAGIC, DELTA_MAGIC_V3, "GRX2/GRX3 delta magic 必须不同");
+    }
 }
