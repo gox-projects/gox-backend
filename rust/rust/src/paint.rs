@@ -990,12 +990,54 @@ impl DisplayList {
                 flex_shrink: if parent_scrollable { 0.0 } else { 1.0 },
                 ..Default::default()
             };
-            // 显式 flex-grow / flex-shrink 属性覆盖默认（补齐与 Skia/Web 的消费差）。
+            // flex 简写（CSS / React Native Yoga 标准写法）：
+            //   flex:1 == flex-grow:1 flex-shrink:1 flex-basis:0
+            // Taffy 默认 flex_basis=auto（按内容宽度打底），等分容器必须设 0，
+            // 否则 4 个按钮在 400px 行里挤成内容宽度（RN Calculator 布局 bug）。
+            if let Some(raw) = p("flex") {
+                let s = raw.trim();
+                match s {
+                    "none" => {
+                        style.flex_grow = 0.0;
+                        style.flex_shrink = 0.0;
+                    }
+                    "auto" => {
+                        style.flex_grow = 1.0;
+                        style.flex_shrink = 1.0;
+                    }
+                    _ => {
+                        let parts: Vec<&str> = s.split_whitespace().collect();
+                        if parts.len() == 1 {
+                            if let Ok(n) = parts[0].parse::<f32>() {
+                                style.flex_grow = n.max(0.0);
+                                style.flex_shrink = 1.0;
+                                style.flex_basis = Dimension::Length(0.0);
+                            }
+                        } else if parts.len() >= 2 {
+                            if let (Ok(g), Ok(sh)) =
+                                (parts[0].parse::<f32>(), parts[1].parse::<f32>())
+                            {
+                                style.flex_grow = g.max(0.0);
+                                style.flex_shrink = sh.max(0.0);
+                            }
+                            if parts.len() >= 3 {
+                                if let Some(b) = parse_px(parts[2]) {
+                                    style.flex_basis = Dimension::Length(b);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // 显式 flex-grow / flex-shrink / flex-basis 覆盖简写值。
             if let Some(v) = p("flex-grow").and_then(parse_px) {
                 style.flex_grow = v.max(0.0);
             }
             if let Some(v) = p("flex-shrink").and_then(parse_px) {
                 style.flex_shrink = v.max(0.0);
+            }
+            if let Some(v) = p("flex-basis").and_then(parse_px) {
+                style.flex_basis = Dimension::Length(v);
             }
             // min/max 尺寸约束。
             if let Some(v) = p("min-width").and_then(parse_px) {

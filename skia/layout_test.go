@@ -398,3 +398,28 @@ func TestMarginAppliesToLayout(t *testing.T) {
 		t.Errorf("margin-right 应产生 20 间距: got %.1f", b.X-a.X-a.W)
 	}
 }
+
+// TestFlexShorthand_RNWCalculator：复现 React Native 官方 Calculator 的
+// flex:1 简写。RN/Yoga 语义下 flex:1 == flex-grow:1 + flex-shrink:1 +
+// flex-basis:0，4 个按钮在 400px 行里应各 100px。
+// 后端若只认 flex-grow 不认 flex 简写，按钮会退化成内容宽度 → 挤成一团。
+func TestFlexShorthand_RNWCalculator(t *testing.T) {
+	row := boxNode("div", map[string]any{
+		"flex-direction": "row", "width": 400, "height": 120,
+	},
+		boxNode("btn", map[string]any{"flex": 1}),
+		boxNode("btn", map[string]any{"flex": 1}),
+		boxNode("btn", map[string]any{"flex": 1}),
+		boxNode("btn", map[string]any{"flex": 1}),
+	)
+	cache := computeLayout(row, 400, 120, fixedMeasure)
+	widths := make([]float32, 4)
+	for i, c := range row.Children {
+		widths[i] = cache[c].W
+	}
+	for i, w := range widths {
+		if !near(w, 100, 1) {
+			t.Errorf("RN flex:1 按钮[%d] 宽度=%.1f, want 100（4 等分 400px）; 实际 widths=%v", i, w, widths)
+		}
+	}
+}

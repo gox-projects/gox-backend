@@ -69,8 +69,10 @@ const (
 	propColumnGap    = "column-gap"
 
 	// flex 弹性与尺寸约束
+	propFlex       = "flex" // CSS/RN 简写：flex:1 == grow:1 shrink:1 basis:0
 	propFlexGrow   = "flex-grow"
 	propFlexShrink = "flex-shrink"
+	propFlexBasis  = "flex-basis"
 	propMinWidth   = "min-width"
 	propMaxWidth   = "max-width"
 	propMinHeight  = "min-height"
@@ -267,6 +269,7 @@ type style struct {
 	// 与"只透传显式样式、不改历史行为"的原则一致）。
 	flexGrow   float32
 	flexShrink float32
+	flexBasis  float32 // NaN=未设置；0 表示 flex:1 的 basis:0（从 Content 改为 0）
 	minWidth   float32
 	maxWidth   float32
 	minHeight  float32
@@ -285,6 +288,7 @@ func defaultStyle() style {
 	return style{
 		color: argb(255, 0, 0, 0), fontSize: 16,
 		opacity: 1, transform: transformSpec{scale: 1},
+		flexBasis: float32(math.NaN()),
 	}
 }
 
@@ -336,9 +340,53 @@ func parseStyle(props map[string]any) style {
 			s.padding = edges(sides)
 		}
 	}
+	// flex 简写（CSS / React Native Yoga 标准写法）：
+	//   flex:<number>  == flex-grow:<n> flex-shrink:1 flex-basis:0
+	//   flex:none      == 0 0 auto；flex:auto == 1 1 auto
+	//   flex:<g> <s> <basis> 三值形式
+	// 显式 flex-grow/flex-shrink/flex-basis 在其后解析，可覆盖简写值。
+	// 注意：flex:1 的 basis 必须是 0（不是 Content）——否则等分容器里
+	// 各按钮按内容宽度打底，只有剩余空间被 grow 分配，视觉上挤成一团。
+	if v, ok := props[propFlex]; ok {
+		switch f := v.(type) {
+		case string:
+			switch strings.ToLower(strings.TrimSpace(f)) {
+			case "none":
+				s.flexGrow, s.flexShrink, s.flexBasis = 0, 0, 0
+			case "auto":
+				s.flexGrow, s.flexShrink = 1, 1
+			default:
+				// 数值或空格分隔的多值
+				parts := strings.Fields(f)
+				if len(parts) == 1 {
+					if n, err := strconv.ParseFloat(parts[0], 64); err == nil {
+						s.flexGrow, s.flexShrink, s.flexBasis = float32(n), 1, 0
+					}
+				} else if len(parts) >= 2 {
+					g, e1 := strconv.ParseFloat(parts[0], 64)
+					sh, e2 := strconv.ParseFloat(parts[1], 64)
+					if e1 == nil && e2 == nil {
+						s.flexGrow, s.flexShrink = float32(g), float32(sh)
+					}
+					if len(parts) >= 3 {
+						if b, e3 := propNum(parts[2]); e3 {
+							s.flexBasis = float32(b)
+						}
+					}
+				}
+			}
+		default:
+			if n, ok := propNum(v); ok {
+				s.flexGrow, s.flexShrink, s.flexBasis = float32(n), 1, 0
+			}
+		}
+	}
 	// flex 弹性与 min/max 约束：数值或 px 字符串；缺省 NaN 表示未设置。
 	if v, ok := propNum(props[propFlexGrow]); ok {
 		s.flexGrow = float32(v)
+	}
+	if v, ok := propNum(props[propFlexBasis]); ok {
+		s.flexBasis = float32(v)
 	}
 	if v, ok := propNum(props[propFlexShrink]); ok {
 		s.flexShrink = float32(v)

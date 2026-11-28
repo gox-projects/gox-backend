@@ -980,6 +980,100 @@
           "value": "600"
         }
       ]
+    },
+    {
+      "name": "flex-shorthand-rnw-calculator",
+      "_comment": "React Native Yoga 标准写法 flex:1（RNW 官方 Calculator 用）。CSS/RN 语义 flex:1 == grow:1 shrink:1 basis:0；4 个按钮在 400px 行里应各 100px。修复前 Skia/Yoga 与 Rust/Taffy 只认 flex-grow 展开属性，忽略简写 → 按钮宽度 0 挤成一团（截图实证）。Web 端浏览器原生支持 flex:1。",
+      "scene": {
+        "kind": "div",
+        "props": {
+          "width": "400",
+          "height": "120",
+          "flex-direction": "row"
+        },
+        "children": [
+          {
+            "kind": "div",
+            "props": {
+              "bg": "#ef1000",
+              "height": "120",
+              "flex": "1"
+            },
+            "name": "btn0"
+          },
+          {
+            "kind": "div",
+            "props": {
+              "bg": "#ef1001",
+              "height": "120",
+              "flex": "1"
+            },
+            "name": "btn1"
+          },
+          {
+            "kind": "div",
+            "props": {
+              "bg": "#ef1002",
+              "height": "120",
+              "flex": "1"
+            },
+            "name": "btn2"
+          },
+          {
+            "kind": "div",
+            "props": {
+              "bg": "#ef1003",
+              "height": "120",
+              "flex": "1"
+            },
+            "name": "btn3"
+          }
+        ]
+      },
+      "expect": [
+        {
+          "kind": "rect",
+          "bg": "#ef1000",
+          "x": 0,
+          "y": 0,
+          "w": 100,
+          "h": 120,
+          "tol": 1.5
+        },
+        {
+          "kind": "rect",
+          "bg": "#ef1001",
+          "x": 100,
+          "y": 0,
+          "w": 100,
+          "h": 120,
+          "tol": 1.5
+        },
+        {
+          "kind": "rect",
+          "bg": "#ef1002",
+          "x": 200,
+          "y": 0,
+          "w": 100,
+          "h": 120,
+          "tol": 1.5
+        },
+        {
+          "kind": "rect",
+          "bg": "#ef1003",
+          "x": 300,
+          "y": 0,
+          "w": 100,
+          "h": 120,
+          "tol": 1.5
+        },
+        {
+          "kind": "style",
+          "name": "btn0",
+          "prop": "flex",
+          "value": "1"
+        }
+      ]
     }
   ]
 }

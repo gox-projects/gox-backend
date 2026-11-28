@@ -1637,6 +1637,37 @@ mod parity_tests {
         t.weight = Some(700);
         assert!(text_sig(&t).contains("@w700"), "字重变化应触发重新 shape");
     }
+    /// flex:1 简写（React Native Yoga 标准写法，RNW 官方 Calculator 使用）：
+    /// 4 个按钮在 400px 行里应各 100px。修复前 Taffy 默认 flex_basis=auto，
+    /// 按内容宽度打底 → 命中框窄成内容宽（界面挤成一团）。
+    /// 本用例复现并防回归；修复点是 paint.rs 把 flex 简写展开为 grow/shrink/basis:0。
+    #[test]
+    fn flex_shorthand_rnw_calculator() {
+        let mut buttons = Vec::new();
+        for i in 0..4 {
+            let mut b = div(&format!("btn{}", i), &[("flex", "1")], vec![]);
+            b.events = vec!["on-click".into()];
+            buttons.push(b);
+        }
+        let root = div(
+            "root",
+            &[("width", "400"), ("height", "120"), ("flex-direction", "row")],
+            buttons,
+        );
+        let dl =
+            DisplayList::from_scene(&root, 400.0, 120.0, &mut crate::layout::LayoutCache::new());
+        assert_eq!(dl.hitboxes.len(), 4, "4 个按钮都应登记命中框");
+        let widths: Vec<f32> = dl.hitboxes.iter().map(|h| h.2).collect();
+        for (i, w) in widths.iter().enumerate() {
+            assert!(
+                (*w - 100.0).abs() < 1.0,
+                "RN flex:1 按钮[{}] 宽度={:.1}, want 100（4 等分 400px）; widths={:?}",
+                i,
+                w,
+                widths
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 package skia
 
 import (
+	"math"
 	"strings"
 
 	yoga "github.com/ahati/yoga-go-binding"
@@ -281,6 +282,11 @@ func buildYogaTree(n *gxscene.Node, measure fontMeasurer, inherited textStyle) (
 		}
 		if s.flexShrink != 0 {
 			yn.SetFlexShrink(s.flexShrink)
+		}
+		// flex:1 简写的 basis:0 必须透传：默认 YGValueAuto 会按内容宽度打底，
+		// 导致等分容器里各子项挤成内容宽度（RN Calculator 布局 bug 根因）。
+		if !math.IsNaN(float64(s.flexBasis)) {
+			yn.SetFlexBasis(s.flexBasis)
 		}
 		if s.minWidth > 0 {
 			yn.SetMinWidth(s.minWidth)
