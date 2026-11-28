@@ -135,6 +135,30 @@ impl GpuFrame {
         GpuFrame { w, h, clear, uploads: Vec::new(), prims: Vec::new() }
     }
 
+    /// 把全部图元几何从逻辑像素等比放大到物理像素（hiDPI）。
+    /// `s=1` 时为 no-op，保证 scale=1 平台行为不变。纹理 UV、颜色、渐变
+    /// 色标不缩放（UV 是源纹理像素坐标，渐变 pos 已归一化）。
+    pub fn scale(&mut self, s: f32) {
+        if (s - 1.0).abs() < 1e-6 {
+            return;
+        }
+        for prim in &mut self.prims {
+            match prim {
+                Prim::Quad(q) => {
+                    for v in &mut q.rect { *v *= s; }
+                    for v in &mut q.clip { *v *= s; }
+                    q.radius *= s;
+                    q.border *= s;
+                }
+                Prim::Tex(t) => {
+                    for v in &mut t.rect { *v *= s; }
+                    for v in &mut t.clip { *v *= s; }
+                    t.radius *= s;
+                }
+            }
+        }
+    }
+
     /// 追加一条纯色圆角矩形。
     pub fn quad(&mut self, rect: [f32; 4], clip: [f32; 4], color: [f32; 4], radius: f32, border: f32) {
         self.prims.push(Prim::Quad(Quad { rect, clip, color, radius, border, grad: None }));

@@ -33,6 +33,7 @@ pub extern "C" fn gx_android_new(
     native_window: *mut c_void,
     width: c_int,
     height: c_int,
+    dpr: f32,
 ) -> *mut AndroidHost {
     if native_window.is_null() || width <= 0 || height <= 0 {
         eprintln!("[gx-android] gx_android_new: 非法参数（空句柄或非正尺寸）");
@@ -42,6 +43,7 @@ pub extern "C" fn gx_android_new(
         native_window,
         width as u32,
         height as u32,
+        dpr,
         Box::new(|| {}), // request_redraw：Android 的帧时机由宿主 paintClock 驱动，无需回调
     ));
     // wgpu 在无 GPU 的 Android 环境（如 swiftshader/TCG 模拟器）下
@@ -117,11 +119,17 @@ pub extern "C" fn gx_android_render(host: *mut AndroidHost) -> c_int {
 
 /// surface 尺寸变化（宿主 size 事件）：resize 渲染目标。
 #[no_mangle]
-pub extern "C" fn gx_android_resize(host: *mut AndroidHost, width: c_int, height: c_int) -> c_int {
+pub extern "C" fn gx_android_resize(
+    host: *mut AndroidHost,
+    width: c_int,
+    height: c_int,
+    dpr: f32,
+) -> c_int {
     if host.is_null() || width <= 0 || height <= 0 {
         return 1;
     }
     let h = unsafe { &*host };
+    h.surface.resize(width as u32, height as u32, dpr);
     let mut g = match h.renderer.lock() {
         Ok(g) => g,
         Err(_) => return 2,

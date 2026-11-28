@@ -39,6 +39,7 @@ import (
 var (
 	_ gxapp.Window         = (*Window)(nil)
 	_ gxapp.FramePresenter = (*Window)(nil)
+	_ gxapp.HostedWindow   = (*Window)(nil)
 	_ scheduler.FrameClock = (*PaintClock)(nil)
 )
 
@@ -124,6 +125,20 @@ func (w *Window) Draw(root *gxscene.Node) error {
 
 // Run 是 no-op：Android 事件循环由 app.Main 驱动，不阻塞在 Window 内。
 func (w *Window) Run() error { return nil }
+
+// Poll 实现 gxapp.HostedWindow（P4 目标态硬约束）：Android 的事件源是
+// x/mobile 的 app.Main（生命周期/size/paint/touch 经 On* 方法转发），装配层
+// 不跑 Host.Run，而在每个 paint 周期手动 DrainTurn（见 main.go）。因此这里
+// 与 Web 后端同语义——无可轮询事件，no-op；存在仅为满足开窗契约。
+func (w *Window) Poll() error { return nil }
+
+// ShouldClose 实现 gxapp.HostedWindow：Android 关闭走 app.Main 生命周期，
+// 不由 Host 主循环查询；窗口 Close 后返回 true，恒不主动触发关闭。
+func (w *Window) ShouldClose() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.closed
+}
 
 func (w *Window) Close() error {
 	w.mu.Lock()
@@ -226,10 +241,10 @@ func (w *Window) OnSize(physW, physH int, dpr float32) {
 	if w.opened {
 		w.rebuildCanvasLocked()
 	}
-	lw, lh := int(float32(physW)/dpr), int(float32(physH)/dpr)
 	w.mu.Unlock()
 	if v2Ready() {
-		v2Resize(lw, lh)
+		// 与 v2New 一致：surface 分辨率用物理像素；dpr 透传给渲染内核做 hiDPI。
+		v2Resize(physW, physH, dpr)
 	}
 }
 
@@ -262,8 +277,11 @@ func (w *Window) OnPaint() bool {
 	// v2Disabled 为真时不重试：本机已判定 V2 不可用，稳定走 GLES 回退。
 	if !v2Ready() && !v2Disabled() {
 		if nw := nativeWindow(); nw != nil {
-			lw, lh := w.logicalSizeLocked()
-			if err := v2New(nw, lw, lh); err != nil {
+			// 与桌面 WinitSurface::pixel_size 对齐：传物理像素尺寸。
+			// 内核按该尺寸同时做布局与 surface 配置（场景 px 即物理 px），
+			// 传逻辑尺寸会让整帧被系统拉伸到高清屏而发虚。
+			log.Printf("[androidbackend] V2 初始化: surface %dx%d (dpr=%.2f)", w.physW, w.physH, w.dpr)
+			if err := v2New(nw, w.physW, w.physH, w.dpr); err != nil {
 				log.Printf("[androidbackend] V2 初始化失败，回退 GLES blit: %v", err)
 			}
 		}
@@ -389,6 +407,25 @@ func (w *Window) Dpr() float32 {
 		return 1
 	}
 	return w.dpr
+}
+
+// RenderPath 返回当前实际渲染路径的短标识，供真机诊断角标显示。
+// 注意：V2 在首个 paint 懒初始化，之前显示 init；连续失败后置为 gles。
+func (w *Window) RenderPath() string {
+	if v2Ready() {
+		return "v2-wgpu"
+	}
+	if v2Disabled() {
+		return "gles-blit"
+	}
+	return "init"
+}
+
+// PhysSize 返回当前物理像素尺寸，供真机诊断角标显示。
+func (w *Window) PhysSize() (int, int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.physW, w.physH
 }
 
 func (w *Window) LogicalSize() (int, int) {

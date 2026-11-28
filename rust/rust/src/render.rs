@@ -31,6 +31,12 @@ pub trait SurfaceProvider: Send + Sync {
         let (w, h) = self.pixel_size();
         (w as f32, h as f32)
     }
+    /// 物理像素 / 逻辑点倍率（hiDPI）。布局在逻辑空间进行，渲染/字形栅格化
+    /// 按该倍率放大到物理 surface。默认 1（scale=1 的平台/无头提供者）。
+    /// Android 高分屏注入 dpr；保证 dpr=1 时整条链路是 no-op。
+    fn scale(&self) -> f32 {
+        1.0
+    }
     /// 平台 display 原始句柄（wgpu SurfaceTargetUnsafe::RawHandle 用）。
     fn raw_display_handle(&self) -> RawDisplayHandle;
     /// 平台 window/surface 原始句柄。
@@ -76,6 +82,9 @@ pub struct Renderer {
     height: u32,
     /// 逻辑尺寸（点，scale 折算后）；resize 时随物理尺寸同步更新（E2E 调试导出）。
     logical: (f32, f32),
+    /// 物理像素 / 逻辑点倍率（hiDPI）。布局在逻辑空间进行；绘制几何与字形
+    /// 栅格化按此倍率放大到物理 surface。scale=1 的平台整条链路是 no-op。
+    scale: f32,
 
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -133,7 +142,18 @@ impl Renderer {
         let (raw_w, raw_h) = provider.pixel_size();
         let w = raw_w.max(1);
         let h = raw_h.max(1);
-        let logical = provider.logical_size();
+        let scale = provider.scale().max(0.01);
+        // 布局在逻辑空间进行（CSS px 保持逻辑语义）；surface/viewport 用物理尺寸。
+        // provider.logical_size() 是权威逻辑尺寸；若 provider 未覆盖（默认=物理），
+        // 用物理/scale 兜底，保证 hiDPI 端点始终一致。
+        let logical = {
+            let (lw, lh) = provider.logical_size();
+            if (lw - w as f32).abs() < 0.01 && (lh - h as f32).abs() < 0.01 && scale != 1.0 {
+                (w as f32 / scale, h as f32 / scale)
+            } else {
+                (lw, lh)
+            }
+        };
         let instance = Instance::new(&InstanceDescriptor::default());
         let adapter = instance
             .request_adapter(&RequestAdapterOptions::default())
@@ -176,18 +196,43 @@ impl Renderer {
         let present_modes = surface.get_capabilities(&adapter).present_modes;
 
         let mut font_system = FontSystem::new();
-        for path in [
+        // 显式字体路径（fontdb 在 Android 上不扫描系统目录，必须手动加载）。
+        // 桌面/移动端各取所需，加载失败的路径静默跳过（EPERM/ENOENT 均可接受）。
+        #[cfg(target_os = "android")]
+        let font_paths: &[&str] = &[
+            // 等宽字体优先：Editor 代码行 font-family 栈含 monospace，
+            // 缺失时代码会 fallback 到比例字体 Roboto，细笔画发虚。
+            // Android 各版本常见等宽字体路径，命中任意一个即可。
+            "/system/fonts/DroidSansMono.ttf",           // Android 2.x~ 经典等宽
+            "/system/fonts/DejaVuSansMono.ttf",          // 部分厂商 ROM
+            "/system/fonts/NotoSansMono-Regular.ttf",    // Android 12+
+            "/system/fonts/RobotoMono-Regular.ttf",      // 可选
+            "/system/fonts/NotoSansCJK-Regular.ttc",     // Android 5.0+ 主力 CJK
+            "/system/fonts/NotoSansCJK-VF.ttf",          // Android 13+ 可变字体
+            "/system/fonts/NotoSansSC-Regular.ttf",      // Android 12+ 简体中文字体
+            "/system/fonts/NotoSansCJKsc-Regular.otf",
+            "/system/fonts/Roboto-Regular.ttf",
+        ];
+        #[cfg(not(target_os = "android"))]
+        let font_paths: &[&str] = &[
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             // 等宽字体：Editor 代码行 font-family 栈含 monospace 时使用，
             // 三端统一（Web ui-monospace / Skia DejaVu Sans Mono）。
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
             "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
-        ] {
-            if let Err(e) = font_system.db_mut().load_font_file(path) {
-                eprintln!("[rust-backend] font {} : {:?}", path, e);
+        ];
+        let mut loaded = 0;
+        for path in font_paths {
+            match font_system.db_mut().load_font_file(path) {
+                Ok(()) => {
+                    loaded += 1;
+                    eprintln!("[rust-backend] font loaded: {}", path);
+                }
+                Err(e) => eprintln!("[rust-backend] font {} : {:?}", path, e),
             }
         }
+        eprintln!("[rust-backend] fonts loaded = {}", loaded);
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
@@ -198,6 +243,7 @@ impl Renderer {
         let gpu = gx_gpu::QuadGpu::new(device.clone(), queue.clone(), fmt);
         Renderer {
             logical,
+            scale,
             device,
             queue,
             config,
@@ -605,6 +651,8 @@ impl Renderer {
         let used: std::collections::HashSet<u64> = used_keys.into_iter().collect();
         self.tex_cache
             .retain(|k, e| e.persistent || used.contains(k));
+        // 逻辑坐标 → 物理像素（hiDPI）。GpuFrame.w/h 保持物理尺寸供 cull/scissor。
+        f.scale(self.scale);
         f
     }
 
@@ -691,10 +739,12 @@ impl Renderer {
                 self.active_id.as_deref(),
                 self.focused_id.as_deref(),
             );
+            // 布局在逻辑空间进行（CSS px 保持逻辑语义），坐标输出为逻辑像素；
+            // 绘制/命中/文本随后按 self.scale 映射到物理 surface。
             let dl = DisplayList::from_scene(
                 &styled,
-                self.width as f32,
-                self.height as f32,
+                self.logical.0,
+                self.logical.1,
                 &mut self.layout_cache,
             );
 
@@ -808,7 +858,15 @@ impl Renderer {
         let frame = self.build_gpu_frame(&src);
 
         // 从当前 DisplayList + 按 ID 缓存的 buffers 组装 areas（有无变化都要做，因为 prepare 每帧消费 areas）。
-        let areas = Self::build_text_areas(&self.glyph_cache, &self.display.texts, self.height as i32);
+        // 坐标从逻辑空间 ×scale 映射到物理像素；TextArea.scale=dpr 让字形按
+        // 字号×dpr 栅格化，高分屏清晰（dpr=1 时全部 no-op）。
+        let phys_h = (self.logical.1 * self.scale).round().max(1.0) as i32;
+        let areas = Self::build_text_areas(
+            &self.glyph_cache,
+            &self.display.texts,
+            phys_h,
+            self.scale,
+        );
         self.text_renderer
             .prepare(
                 &self.device,
@@ -831,6 +889,7 @@ impl Renderer {
         glyphs: &'a std::collections::HashMap<u64, GlyphEntry>,
         texts: &'a [crate::paint::TextDraw],
         win_h: i32,
+        scale: f32,
     ) -> Vec<TextArea<'a>> {
         texts
             .iter()
@@ -839,25 +898,29 @@ impl Renderer {
                     Some(e) => &e.buffer,
                     None => return None, // 理论上不会发生；防御性跳过缺字形的项
                 };
+                // 逻辑坐标 → 物理像素：TextArea 的 left/top/bounds 均在物理空间。
+                // glyphon 内部按 scale 放大字形栅格化与相对位移，buffer 保持逻辑字号。
+                let left = t.x * scale;
+                let top = t.y * scale;
                 let bounds = match t.clip {
                     Some((cx, cy, cw, ch)) => TextBounds {
-                        left: (cx - t.x - 20.0) as i32,
-                        top: (cy - t.y - 20.0) as i32,
-                        right: (cx + cw - t.x) as i32,
-                        bottom: (cy + ch - t.y) as i32,
+                        left: ((cx - t.x - 20.0) * scale) as i32,
+                        top: ((cy - t.y - 20.0) * scale) as i32,
+                        right: ((cx + cw - t.x) * scale) as i32,
+                        bottom: ((cy + ch - t.y) * scale) as i32,
                     },
                     None => TextBounds {
-                        left: -20,
-                        top: -20,
-                        right: 720,
+                        left: (-20.0 * scale) as i32,
+                        top: (-20.0 * scale) as i32,
+                        right: (720.0 * scale) as i32,
                         bottom: win_h,
                     },
                 };
                 Some(TextArea {
                     buffer: b,
-                    left: t.x,
-                    top: t.y,
-                    scale: 1.0,
+                    left,
+                    top,
+                    scale,
                     bounds,
                     // opacity（含声明式 blink 采样）作用于文字 alpha，对齐 Skia/Web。
                     // glyphon 颜色为 pre-multiplied，按 alpha 缩放三通道。
@@ -1125,6 +1188,8 @@ impl Renderer {
         // 仅更新本端尺寸/缓存（P4.6：surface 重配置由渲染线程经 PresentHub 执行）。
         self.config.width = w.max(1);
         self.config.height = h.max(1);
+        // dpr 可能随 size 事件变化（跨屏/系统缩放）：与 provider 重新同步。
+        self.scale = self.provider.scale().max(0.01);
         self.logical = self.provider_logical();
         // 尺寸相关缓存失效：下一帧必须重算布局与文本。
         self.frame_dirty = true;

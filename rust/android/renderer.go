@@ -16,10 +16,10 @@ package androidbackend
 #include <stdlib.h>
 #include <stdint.h>
 
-extern void*       gx_android_new(void* native_window, int width, int height);
+extern void*       gx_android_new(void* native_window, int width, int height, float dpr);
 extern int         gx_android_apply(void* host, const unsigned char* buf, int len);
 extern int         gx_android_render(void* host);
-extern int         gx_android_resize(void* host, int width, int height);
+extern int         gx_android_resize(void* host, int width, int height, float dpr);
 extern int         gx_android_set_window(void* host, void* native_window, int width, int height);
 extern void        gx_android_destroy(void* host);
 extern const char* gx_android_version();
@@ -58,11 +58,12 @@ func Version() string {
 }
 
 // v2New 在 surface 就绪时构造 Rust 渲染宿主。失败可由上层重试。
-func v2New(nativeWindow unsafe.Pointer, w, h int) error {
+// dpr = 物理像素/逻辑点，用于字形栅格化与几何hiDPI缩放（桌面端等价 1.0）。
+func v2New(nativeWindow unsafe.Pointer, w, h int, dpr float32) error {
 	if v2r.inited {
 		v2Destroy()
 	}
-	host := C.gx_android_new(nativeWindow, C.int(w), C.int(h))
+	host := C.gx_android_new(nativeWindow, C.int(w), C.int(h), C.float(dpr))
 	if host == nil {
 		return fmt.Errorf("gx_android_new: wgpu 初始化失败")
 	}
@@ -70,22 +71,24 @@ func v2New(nativeWindow unsafe.Pointer, w, h int) error {
 	return nil
 }
 
-func v2SetWindow(nativeWindow unsafe.Pointer, w, h int) error {
+func v2SetWindow(nativeWindow unsafe.Pointer, w, h int, dpr float32) error {
 	if !v2r.inited {
-		return v2New(nativeWindow, w, h)
+		return v2New(nativeWindow, w, h, dpr)
 	}
 	if rc := C.gx_android_set_window(v2r.host, nativeWindow, C.int(w), C.int(h)); rc != 0 {
 		return fmt.Errorf("gx_android_set_window rc=%d", rc)
 	}
+	// surface 重建后同步 dpr（set_window 复用同一 provider，dpr 经 resize 更新）。
+	C.gx_android_resize(v2r.host, C.int(w), C.int(h), C.float(dpr))
 	v2r.physW, v2r.physH = w, h
 	return nil
 }
 
-func v2Resize(w, h int) {
-	if !v2r.inited || w <= 0 || h <= 0 || (w == v2r.physW && h == v2r.physH) {
+func v2Resize(w, h int, dpr float32) {
+	if !v2r.inited || w <= 0 || h <= 0 {
 		return
 	}
-	C.gx_android_resize(v2r.host, C.int(w), C.int(h))
+	C.gx_android_resize(v2r.host, C.int(w), C.int(h), C.float(dpr))
 	v2r.physW, v2r.physH = w, h
 }
 

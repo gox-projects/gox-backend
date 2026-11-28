@@ -26,8 +26,11 @@ pub struct AndroidSurface {
 struct Inner {
     /// `ANativeWindow*`（宿主注入；NonNull 契约在构造时强制）。
     native_window: std::ptr::NonNull<std::ffi::c_void>,
+    /// 物理像素尺寸（surface/viewport 口径）。
     w: u32,
     h: u32,
+    /// 物理像素 / 逻辑点倍率（Android density）。字形栅格化与绘制坐标据此放大。
+    scale: f32,
 }
 
 // 安全性：本指针从不被解引用——只作为 opaque 句柄转发给 wgpu 的
@@ -43,6 +46,7 @@ impl AndroidSurface {
         ptr: *mut std::ffi::c_void,
         w: u32,
         h: u32,
+        scale: f32,
         redraw: Box<dyn Fn() + Send + Sync>,
     ) -> Self {
         assert!(
@@ -54,6 +58,7 @@ impl AndroidSurface {
                 native_window: std::ptr::NonNull::new(ptr).expect("nonnull"),
                 w,
                 h,
+                scale: if scale > 0.0 { scale } else { 1.0 },
             }),
             redraw,
         }
@@ -67,12 +72,30 @@ impl AndroidSurface {
         g.w = w;
         g.h = h;
     }
+
+    /// 尺寸/密度变化（size.Event）：更新物理尺寸与 dpr。
+    pub fn resize(&self, w: u32, h: u32, scale: f32) {
+        let mut g = self.inner.lock().expect("lock");
+        g.w = w;
+        g.h = h;
+        if scale > 0.0 {
+            g.scale = scale;
+        }
+    }
 }
 
 impl SurfaceProvider for AndroidSurface {
     fn pixel_size(&self) -> (u32, u32) {
         let g = self.inner.lock().expect("lock");
         (g.w, g.h)
+    }
+    fn logical_size(&self) -> (f32, f32) {
+        let g = self.inner.lock().expect("lock");
+        (g.w as f32 / g.scale, g.h as f32 / g.scale)
+    }
+    fn scale(&self) -> f32 {
+        let g = self.inner.lock().expect("lock");
+        g.scale
     }
     fn raw_display_handle(&self) -> RawDisplayHandle {
         RawDisplayHandle::Android(raw_window_handle::AndroidDisplayHandle::new())
@@ -102,7 +125,7 @@ mod tests {
 
     #[test]
     fn android_surface_handles_and_size() {
-        let s = AndroidSurface::from_native_window(fake_window_ptr(), 1080, 2400, Box::new(|| {}));
+        let s = AndroidSurface::from_native_window(fake_window_ptr(), 1080, 2400, 1.0, Box::new(|| {}));
         assert_eq!(s.pixel_size(), (1080, 2400));
         assert!(matches!(
             s.raw_display_handle(),
@@ -118,7 +141,7 @@ mod tests {
 
     #[test]
     fn android_surface_lifecycle_recreate() {
-        let s = AndroidSurface::from_native_window(fake_window_ptr(), 1080, 2400, Box::new(|| {}));
+        let s = AndroidSurface::from_native_window(fake_window_ptr(), 1080, 2400, 1.0, Box::new(|| {}));
         // 旋转屏幕：onSurfaceDestroyed → onSurfaceCreated(w×h 交换)。
         s.set_native_window(0x2000 as *mut std::ffi::c_void, 2400, 1080);
         assert_eq!(s.pixel_size(), (2400, 1080));
@@ -138,6 +161,7 @@ mod tests {
             fake_window_ptr(),
             100,
             100,
+            1.0,
             Box::new(move || {
                 h2.fetch_add(1, Ordering::SeqCst);
             }),
@@ -154,6 +178,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "不能为空")]
     fn android_surface_rejects_null_window() {
-        let _ = AndroidSurface::from_native_window(std::ptr::null_mut(), 100, 100, Box::new(|| {}));
+        let _ = AndroidSurface::from_native_window(std::ptr::null_mut(), 100, 100, 1.0, Box::new(|| {}));
     }
 }
