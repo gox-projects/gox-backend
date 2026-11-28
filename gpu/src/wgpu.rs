@@ -44,6 +44,8 @@ pub struct QuadGpu {
     tex_buf: wgpu::Buffer,
     grad_buf: wgpu::Buffer,
     grad_bind: wgpu::BindGroup,
+    /// 视口尺寸 uniform（像素 → NDC），quad 用 binding1 / tex 用 binding2 共享此 buffer。
+    screen_buf: wgpu::Buffer,
     tex_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     /// 纹理注册表：id → (texture, bind_group, content key)。
@@ -62,16 +64,29 @@ impl QuadGpu {
         // ---- quad 管线 ----
         let grad_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("gx-grad-bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new((GRAD_TABLE_FLOATS * 4) as u64),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new((GRAD_TABLE_FLOATS * 4) as u64),
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                // quad 顶点着色器读视口尺寸做像素→NDC 变换。
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(16),
+                    },
+                    count: None,
+                },
+            ],
         });
         let grad_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gx-grad-table"),
@@ -79,13 +94,19 @@ impl QuadGpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let screen_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gx-screen"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let grad_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("gx-grad-bind"),
             layout: &grad_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: grad_buf.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: grad_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: screen_buf.as_entire_binding() },
+            ],
         });
         let quad_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("gx-quad-pl"),
@@ -137,6 +158,17 @@ impl QuadGpu {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // tex 顶点着色器读视口尺寸做像素→NDC（与 quad 共享 screen_buf）。
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(16),
+                    },
+                    count: None,
+                },
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -180,7 +212,7 @@ impl QuadGpu {
             device, queue,
             quad_pipeline, tex_pipeline,
             quad_buf, tex_buf,
-            grad_buf, grad_bind, tex_bgl, sampler,
+            grad_buf, grad_bind, screen_buf, tex_bgl, sampler,
             textures: HashMap::new(),
             quad_cap: 0,
             tex_cap: 0,
@@ -239,6 +271,7 @@ impl QuadGpu {
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.screen_buf.as_entire_binding() },
                 ],
             });
             self.textures.insert(up.id, (tex, bind, up.key));
@@ -255,6 +288,8 @@ impl QuadGpu {
         }
         let w = frame.w as f32;
         let h = frame.h as f32;
+        // 写视口尺寸 uniform：顶点着色器据此把像素坐标转成 NDC。
+        self.queue.write_buffer(&self.screen_buf, 0, bytes_of(&[w, h, 0.0, 0.0]));
 
         // ---- 构建实例数据与批次表（单遍，保文档序）----
         let mut grad_table = vec![0f32; GRAD_TABLE_FLOATS];
@@ -591,6 +626,8 @@ fn write_grad(table: &mut [f32], idx: usize, g: &Grad) {
 const WGSL: &str = r#"
 struct GradTable { pos_rgb: array<vec4f, 512>, alpha: array<vec4f, 512> };
 @group(0) @binding(0) var<uniform> grads: GradTable;
+// 视口尺寸 (width, height, ·, ·)：像素坐标 → NDC 的除法基准。
+@group(0) @binding(1) var<uniform> screen: vec4f;
 
 // 注意：instance 输入只能在 vertex 阶段读取；fragment 需要的字段经插值传递。
 
@@ -622,7 +659,10 @@ fn cov(d: f32) -> f32 { return clamp(0.5 - d, 0.0, 1.0); }
     vec2f(0.0,0.0), vec2f(1.0,1.0), vec2f(0.0,1.0));
   let k = c[vi];
   var o: QuadOut;
-  o.pos = vec4f(q.rect.xy + k * q.rect.zw, 0.0, 1.0);
+  // 像素坐标 → NDC（y 轴翻转：屏幕 y 向下，NDC y 向上）。
+  let px = q.rect.xy + k * q.rect.zw;
+  let ndc = (px / max(screen.xy, vec2f(1.0))) * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0);
+  o.pos = vec4f(ndc, 0.0, 1.0);
   o.local = (k - vec2f(0.5, 0.5)) * q.rect.zw;
   o.half = q.rect.zw * 0.5;
   o.color = q.color;
@@ -689,7 +729,9 @@ struct TexOut {
     vec2f(0.0,0.0), vec2f(1.0,1.0), vec2f(0.0,1.0));
   let k = c[vi];
   var o: TexOut;
-  o.pos = vec4f(t.rect.xy + k * t.rect.zw, 0.0, 1.0);
+  let px = t.rect.xy + k * t.rect.zw;
+  let ndc = (px / max(screen_tex.xy, vec2f(1.0))) * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0);
+  o.pos = vec4f(ndc, 0.0, 1.0);
   o.local = (k - vec2f(0.5, 0.5)) * t.rect.zw;
   o.half = t.rect.zw * 0.5;
   o.uv = vec2f(mix(t.uv.x, t.uv.z, k.x), mix(t.uv.y, t.uv.w, k.y));
@@ -700,6 +742,7 @@ struct TexOut {
 
 @group(0) @binding(0) var tex_src: texture_2d<f32>;
 @group(0) @binding(1) var tex_smp: sampler;
+@group(0) @binding(2) var<uniform> screen_tex: vec4f;
 
 @fragment fn tex_fs(in: TexOut) -> @location(0) vec4f {
   let d = sd_round_rect(in.local, in.half, in.misc.x);
@@ -816,5 +859,62 @@ mod tests {
         assert!(cull([0.0, 0.0, 0.0, 10.0], 100.0, 100.0), "零宽应剔除");
         assert!(cull([-20.0, 0.0, 10.0, 10.0], 100.0, 100.0), "完全越界应剔除");
         assert!(!cull([10.0, 10.0, 10.0, 10.0], 100.0, 100.0));
+    }
+
+    /// 真正读回像素：验证 quad 着色器画出的颜色正确（不是只验证不 panic）。
+    #[test]
+    fn quad_draw_pixel_readback() {
+        let Some((device, queue)) = pollster::block_on(device_or_skip()) else { return };
+        let mut gpu = QuadGpu::new(device.clone(), queue.clone(), wgpu::TextureFormat::Rgba8Unorm);
+        let mut f = GpuFrame::new(64, 64, [0.0, 0.0, 0.0, 255.0]);
+        // 整屏红色 quad，无圆角无描边
+        f.quad([0.0, 0.0, 64.0, 64.0], [0.0, 0.0, 0.0, 0.0], [255.0, 0.0, 0.0, 255.0], 0.0, 0.0);
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("readback"),
+            size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view, resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+            });
+            gpu.draw(&mut pass, &f);
+        }
+        // copy 到 buffer
+        let row_bytes = 64 * 4;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: (row_bytes * 64) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+        });
+        enc.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::ImageCopyBuffer { buffer: &buf, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(row_bytes), rows_per_image: Some(64) } },
+            wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(enc.finish()));
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::Wait);
+        let data = slice.get_mapped_range();
+        // 中心像素 (16,16)
+        let off = (32 * row_bytes + 32 * 4) as usize;
+        let px = [data[off], data[off+1], data[off+2], data[off+3]];
+        println!("READBACK center pixel = {:?}", px);
+        drop(data);
+        buf.unmap();
+        assert!(px[0] > 200 && px[1] < 50 && px[2] < 50, "quad 应为红色，实际 {:?}", px);
     }
 }
