@@ -2,7 +2,12 @@ package rustbackend
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../rust/target/release
-#cgo !android LDFLAGS: -L${SRCDIR}/../rust/target/release -lgxbackend_rust -lpthread -ldl -lm
+// 非 android 平台按 GOOS 分支：mingw 没有 libdl（dl* 由 kernel32 提供），
+// Windows 下 -ldl 会让 ld 直接报 cannot find -ldl；macOS libdl 是 libSystem
+// 别名，-ldl 可留可去，这里统一去掉保持简单。
+#cgo linux,!android LDFLAGS: -L${SRCDIR}/../rust/target/release -lgxbackend_rust -lpthread -ldl -lm
+#cgo darwin,!android LDFLAGS: -L${SRCDIR}/../rust/target/release -lgxbackend_rust -lpthread -lm
+#cgo windows LDFLAGS: -L${SRCDIR}/../rust/target/release -lgxbackend_rust -lpthread -lm
 #cgo android LDFLAGS: -lgxbackend_rust -ldl -lm -llog -landroid
 #cgo android,arm64 LDFLAGS: -L${SRCDIR}/../../rust/rust/target/aarch64-linux-android/release
 #cgo android,amd64 LDFLAGS: -L${SRCDIR}/../../rust/rust/target/x86_64-linux-android/release
