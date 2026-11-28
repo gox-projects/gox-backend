@@ -690,8 +690,11 @@ fn cov(d: f32) -> f32 { return clamp(0.5 - d, 0.0, 1.0); }
   var a = cov(d);
   let bw = in.misc.y;
   if (bw > 0.0) {
-    // 描边环：带心路径径（-bw/2..+bw/2），与 tiny-skia stroke_path 同几何。
-    a = clamp(cov(d - bw * 0.5) - cov(d + bw * 0.5), 0.0, 1.0);
+    // 内侧描边（CSS border 语义）：描边环完整落在元素边界内侧 d ∈ [-bw, 0]。
+    // 旧实现用带心环 cov(d-bw/2)-cov(d+bw/2)，0.5px hairline 时圆角弧线像素
+    // 覆盖率峰值是直边的 2×（0.5 vs 0.25），四角出现亮斑、弧线粗细不均，
+    // 观感上"圆角不圆滑"。内侧环使直边与圆角覆盖率一致（均 ~bw），弧线均匀。
+    a = clamp(cov(d) - cov(d + bw), 0.0, 1.0);
   }
   var rgb = in.color.rgb / 255.0;
   var alpha = (in.color.a / 255.0) * a;

@@ -69,7 +69,7 @@ impl CpuBackend {
     }
 
     fn paint_quad(&self, pm: &mut tiny_skia::Pixmap, q: &Quad) {
-        use tiny_skia::{Color, FillRule, Paint, Stroke, Transform};
+        use tiny_skia::{Color, FillRule, Paint, Transform};
         let [x, y, w, h] = q.rect;
         if w <= 0.0 || h <= 0.0 {
             return;
@@ -115,9 +115,23 @@ impl CpuBackend {
         p.set_color(Color::from_rgba8(q.color[0] as u8, q.color[1] as u8, q.color[2] as u8, a));
         p.anti_alias = true;
         if q.border > 0.0 {
-            // 描边环：带心路径径（与 tiny-skia stroke_path / GPU band 同几何）。
-            pm.stroke_path(&path, &p, &Stroke { width: q.border, ..Default::default() },
-                Transform::identity(), None);
+            // 内侧描边（CSS border 语义，与 GPU shader cov(d)-cov(d+bw) 同几何）：
+            // 描边环完整落在元素边界内侧，外轮廓 = 元素边界，内轮廓 = 内缩 bw。
+            // 用两条同向子路径 + EvenOdd 填充规则得到环；圆角处内外半径差恒为 bw，
+            // 覆盖率与直边一致，避免旧 stroke_path 带心描边在圆角处 ~2× 亮斑。
+            let bw = q.border;
+            let ix = x + bw;
+            let iy = y + bw;
+            let iw = (w - 2.0 * bw).max(0.0);
+            let ih = (h - 2.0 * bw).max(0.0);
+            let inner = round_rect_path(ix, iy, iw, ih, (q.radius - bw).max(0.0))
+                .unwrap_or_else(|| round_rect_path(ix, iy, iw, ih, 0.0).unwrap());
+            let mut pb = tiny_skia::PathBuilder::new();
+            pb.push_path(&path);
+            pb.push_path(&inner);
+            if let Some(ring) = pb.finish() {
+                pm.fill_path(&ring, &p, FillRule::EvenOdd, Transform::identity(), None);
+            }
         } else {
             pm.fill_path(&path, &p, FillRule::Winding, Transform::identity(), None);
         }
@@ -286,6 +300,33 @@ mod tests {
         assert!(edge.green() > 100, "边框带应着色: {:?}", edge);
         let inner = pm.pixel(5, 10).unwrap();
         assert_eq!(inner.green(), 0, "描边内不应着色");
+    }
+
+    /// 回归：内侧描边在圆角弧线与直边的覆盖率应一致。
+    /// 旧带心描边在 0.5px hairline 下圆角峰值是直边的 ~2×，形成角点亮斑。
+    #[test]
+    fn border_rounded_corner_matches_straight_edge() {
+        let mut b = CpuBackend::new();
+        let mut f = GpuFrame::new(80, 80, [0.0, 0.0, 0.0, 255.0]);
+        // 圆角按钮：radius=12, hairline=0.5，描边纯绿。
+        f.quad([10.0, 10.0, 60.0, 60.0], [0.0, 0.0, 0.0, 0.0],
+            [0.0, 255.0, 0.0, 255.0], 12.0, 0.5);
+        let pm = b.render(&f);
+        // 直边：顶边中段 (40, 10) 像素中心落在描边带内。
+        let straight = pm.pixel(40, 10).unwrap().green() as f32;
+        assert!(straight > 40.0, "直边应有描边: {}", straight);
+        // 圆角弧线：沿 45° 对角线取弧上若干点，亮度不应超过直边的 1.4×。
+        // 中心 (40,40)，圆角半径 12 → 弧心在 (22,22)，45° 方向 r=12 处约 (13.5,13.5)。
+        let mut peak = 0u8;
+        for &(px, py) in &[(13,13), (14,14), (15,15), (12,14), (14,12), (12,12), (16,16)] {
+            let g = pm.pixel(px, py).unwrap().green();
+            if g > peak { peak = g; }
+        }
+        assert!(
+            (peak as f32) <= straight * 1.4,
+            "圆角弧线峰值 {} 不应显著超过直边 {}（内侧描边应均匀）",
+            peak, straight
+        );
     }
 
     #[test]
