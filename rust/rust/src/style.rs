@@ -273,10 +273,39 @@ fn parse_custom_animation(s: &str) -> Option<AnimationSpec> {
     }
 }
 
-/// 解析 animation-keyframes JSON 串：
-///   [{"offset":"0","props":{"opacity":"0"}},...]
-/// 非法/空返回空表（静默回退，不 panic）。offset 是 0..1 或 "0%" 形式。
+/// animation-keyframes JSON 串 → 解析结果的内容寻址缓存。
+///
+/// 关键帧来自编译期静态 struct，逻辑上只需要解析一次；但 Rust 采样每帧都会
+/// 经 `animation_from_props` 重新解析同一个串（tree_has_animation + apply 各一次）。
+/// 以 JSON 串本身为 key（串变则 key 变，天然正确、无需显式失效），命中直接 clone
+/// 缓存值。线程局部存储保证无锁；Vec<Keyframe> 全为 Send 类型，不影响 Renderer
+/// 移交 present 线程。cache 有上限，防止异常情况动态串导致无界增长。
+const KEYFRAMES_CACHE_MAX: usize = 512;
+
+thread_local! {
+    static KEYFRAMES_CACHE: std::cell::RefCell<HashMap<String, Vec<Keyframe>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// 解析 animation-keyframes JSON 串，带内容寻址缓存。
+/// 非法/空也缓存为空表（静默回退，不 panic）。offset 支持 0..1 或 "0%" 形式。
 fn parse_keyframes(json: &str) -> Vec<Keyframe> {
+    KEYFRAMES_CACHE.with(|cache| {
+        if let Some(v) = cache.borrow().get(json) {
+            return v.clone();
+        }
+        let parsed = parse_keyframes_uncached(json);
+        let mut c = cache.borrow_mut();
+        if c.len() >= KEYFRAMES_CACHE_MAX {
+            c.clear();
+        }
+        c.insert(json.to_string(), parsed.clone());
+        parsed
+    })
+}
+
+/// 真正的解析逻辑（无缓存）。非法/空返回空表，不 panic。
+fn parse_keyframes_uncached(json: &str) -> Vec<Keyframe> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return Vec::new();
     };
@@ -851,6 +880,47 @@ pub fn easing_value(e: Easing, t: f32) -> f32 {
 // 按当前命中的 hovered/active 节点把对应子表覆盖进一棵临时树副本，
 // 与 Animator::apply 同构——不污染常驻镜像树，下一帧状态变了自动还原。
 
+/// 伪状态子表 JSON → KV 列表的内容寻址缓存。与关键帧同理：子样式表由
+/// encodeSubStyle 编码、编译期静态，但每帧命中节点都要解析一次。以串为 key，
+/// 命中 clone 缓存值；None 表示非法 JSON，同样缓存（静默回退语义不变）。
+const PSEUDO_CACHE_MAX: usize = 512;
+
+thread_local! {
+    static PSEUDO_JSON_CACHE: std::cell::RefCell<HashMap<String, Option<Vec<(String, String)>>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn parse_pseudo_json(json: &str) -> Option<Vec<(String, String)>> {
+    PSEUDO_JSON_CACHE.with(|cache| {
+        if let Some(v) = cache.borrow().get(json) {
+            return v.clone();
+        }
+        let parsed = parse_pseudo_json_uncached(json);
+        let mut c = cache.borrow_mut();
+        if c.len() >= PSEUDO_CACHE_MAX {
+            c.clear();
+        }
+        c.insert(json.to_string(), parsed.clone());
+        parsed
+    })
+}
+
+fn parse_pseudo_json_uncached(json: &str) -> Option<Vec<(String, String)>> {
+    let obj = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    let map = obj.as_object()?;
+    let mut out = Vec::with_capacity(map.len());
+    for (k, v) in map {
+        let s = match v {
+            serde_json::Value::String(x) => x.clone(),
+            serde_json::Value::Number(x) => x.to_string(),
+            serde_json::Value::Bool(x) => x.to_string(),
+            _ => continue,
+        };
+        out.push((k.clone(), s));
+    }
+    Some(out)
+}
+
 /// 把某个节点的伪状态子表覆盖进它的 props。伪状态 key 用 "&:"，兼容旧 "$:"。
 /// 返回是否发生了覆盖（供调用方决定是否要重建 DisplayList）。
 fn overlay_pseudo(props: &mut std::collections::HashMap<String, String>, pseudo: &str) -> bool {
@@ -861,21 +931,12 @@ fn overlay_pseudo(props: &mut std::collections::HashMap<String, String>, pseudo:
     let Some(json) = val else {
         return false;
     };
-    let Ok(obj) = serde_json::from_str::<serde_json::Value>(&json) else {
-        return false;
-    };
-    let Some(map) = obj.as_object() else {
+    let Some(kvs) = parse_pseudo_json(&json) else {
         return false;
     };
     let mut changed = false;
-    for (k, v) in map {
-        let s = match v {
-            serde_json::Value::String(x) => x.clone(),
-            serde_json::Value::Number(x) => x.to_string(),
-            serde_json::Value::Bool(x) => x.to_string(),
-            _ => continue,
-        };
-        props.insert(k.clone(), s);
+    for (k, s) in kvs {
+        props.insert(k, s);
         changed = true;
     }
     changed
@@ -1935,6 +1996,77 @@ mod tests {
             .expect("应输出 opacity");
         assert!((op - 0.5).abs() < 0.01, "数字 offset/prop 中点≈0.5, got {}", op);
     }
+
+    // ===== 内容寻址缓存正确性 =====
+
+    #[test]
+    fn cache_keyframes_same_string_equivalent() {
+        // 同一 JSON 串连续解析（第二次走缓存 clone）结果必须完全等价。
+        let json = r##"[{"offset":"0","props":{"opacity":"0","bg":"#000"}},{"offset":"1","props":{"opacity":"1","bg":"#fff"}}]"##;
+        let first = parse_keyframes(json);
+        let second = parse_keyframes(json);
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.offset, b.offset);
+            assert_eq!(a.props, b.props);
+        }
+        // 缓存值是 clone，不是共享引用：改一份不影响另一份。
+        let mut mutated = second.clone();
+        mutated[0].props.insert("opacity".into(), "9".into());
+        assert_eq!(parse_keyframes(json)[0].props["opacity"], "0");
+    }
+
+    #[test]
+    fn cache_keyframes_different_strings_distinct() {
+        let a = r##"[{"offset":"0","props":{"opacity":"0"}}]"##;
+        let b = r##"[{"offset":"0","props":{"opacity":"1"}}]"##;
+        assert_eq!(parse_keyframes(a)[0].props["opacity"], "0");
+        assert_eq!(parse_keyframes(b)[0].props["opacity"], "1");
+        // 再次交叉确认缓存未串味。
+        assert_eq!(parse_keyframes(a)[0].props["opacity"], "0");
+    }
+
+    #[test]
+    fn cache_keyframes_preserves_sort_and_bad_fallback() {
+        // 乱序串：首次解析已排序；缓存命中后仍须是排序结果。
+        let unordered = r##"[{"offset":"1","props":{"opacity":"1"}},{"offset":"0","props":{"opacity":"0"}}]"##;
+        let first = parse_keyframes(unordered);
+        let cached = parse_keyframes(unordered);
+        assert_eq!(first[0].offset, 0.0);
+        assert_eq!(cached[0].offset, 0.0);
+        // 坏 JSON 缓存为空表，不 panic、不污染后续合法串。
+        assert!(parse_keyframes("not json").is_empty());
+        assert!(parse_keyframes("not json").is_empty());
+        assert!(!parse_keyframes(unordered).is_empty());
+    }
+
+    #[test]
+    fn cache_pseudo_json_equivalent_and_fallback() {
+        let json = r##"{"bg":"#eee","color":"#333"}"##;
+        let first = parse_pseudo_json(json).unwrap();
+        let second = parse_pseudo_json(json).unwrap();
+        assert_eq!(first, second);
+        // 非法 JSON 缓存为 None，不影响合法串。
+        assert!(parse_pseudo_json("not json").is_none());
+        assert!(parse_pseudo_json("not json").is_none());
+        assert_eq!(parse_pseudo_json(json).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cache_pseudo_overlay_semantics_unchanged() {
+        // 缓存路径下 hover 覆盖语义不变：命中写值、未命中不动。
+        let mut props = HashMap::new();
+        props.insert("bg".to_string(), "#fff".to_string());
+        props.insert("&:hover".to_string(), r##"{"bg":"#eee","color":"#333"}"##.to_string());
+        assert!(overlay_pseudo(&mut props, "&:hover"));
+        assert_eq!(props["bg"], "#eee");
+        assert_eq!(props["color"], "#333");
+        // 第二次调用（走缓存）仍幂等。
+        assert!(overlay_pseudo(&mut props, "&:hover"));
+        assert_eq!(props["bg"], "#eee");
+        // 无子表的伪状态返回 false。
+        assert!(!overlay_pseudo(&mut props, "&:focus"));
+    }
 }
 
 #[cfg(test)]
@@ -2039,5 +2171,67 @@ mod parity_tests {
         let sh = parse_box_shadow("0 20px 56px 0 #00000066").unwrap();
         assert_eq!((sh.offset_y, sh.blur, sh.spread), (20.0, 56.0, 0.0));
         assert_eq!(sh.color, (0, 0, 0, 0x66));
+    }
+}
+
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// 缓存 vs 无缓存的真实成本对照。release 基准：`cargo test --release --lib bench_tests -- --ignored --nocapture`
+    /// 常规测试默认忽略（含 20 万次循环，避免拖慢 CI）。
+    #[test]
+    #[ignore = "release benchmark"]
+    fn bench_keyframes_cache_vs_parse() {
+        const KF: &str = r##"[{"offset":"0","props":{"bg":"#000000","opacity":"0","transform":"translateX(-100px)"}},{"offset":"0.5","props":{"opacity":"0.5"}},{"offset":"1","props":{"bg":"#ffffff","opacity":"1","transform":"translateX(0px)"}}]"##;
+        let n = 200_000;
+
+        // 预热缓存，确保命中路径。
+        let _ = parse_keyframes(KF);
+        let t = Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..n {
+            sink += parse_keyframes(KF).len();
+        }
+        let cached = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+
+        let t = Instant::now();
+        for _ in 0..n {
+            sink += parse_keyframes_uncached(KF).len();
+        }
+        let uncached = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+
+        println!(
+            "BENCH parse_keyframes: cached {:.3} us/call, uncached {:.3} us/call, {:.1}x (sink={})",
+            cached, uncached, uncached / cached, sink
+        );
+        assert!(sink > 0);
+    }
+
+    #[test]
+    #[ignore = "release benchmark"]
+    fn bench_pseudo_cache_vs_parse() {
+        const PSEUDO: &str = r##"{"bg":"#eeeeee","color":"#333333","border-color":"#cccccc","opacity":"0.9"}"##;
+        let n = 200_000;
+        let _ = parse_pseudo_json(PSEUDO);
+        let t = Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..n {
+            sink += parse_pseudo_json(PSEUDO).map(|v| v.len()).unwrap_or(0);
+        }
+        let cached = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+
+        let t = Instant::now();
+        for _ in 0..n {
+            sink += parse_pseudo_json_uncached(PSEUDO).map(|v| v.len()).unwrap_or(0);
+        }
+        let uncached = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+
+        println!(
+            "BENCH parse_pseudo_json: cached {:.3} us/call, uncached {:.3} us/call, {:.1}x (sink={})",
+            cached, uncached, uncached / cached, sink
+        );
+        assert!(sink > 0);
     }
 }
